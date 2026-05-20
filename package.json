@@ -1,0 +1,14 @@
+{
+  "name": "cardinal-analytics",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "scanner.js",
+  "scripts": {
+    "start": "node scanner.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
