@@ -193,12 +193,14 @@ async function getCryptoDiscovery() {
 }
 
 function analyze(item, candles) {
-  if (!candles || candles.length < 30) return null;
+  if (!candles || candles.length < 50) return null;
 
   const recent = candles.slice(-24);
   const prior = candles.slice(-48, -24);
 
   const last = recent.at(-1);
+  const prev = recent.at(-2);
+
   const closes = recent.map(c => c.close);
   const highs = recent.map(c => c.high);
   const lows = recent.map(c => c.low);
@@ -208,7 +210,7 @@ function analyze(item, candles) {
   const price = last.close;
   const recentHigh = Math.max(...highs);
   const recentLow = Math.min(...lows);
-  const priorHigh = prior.length ? Math.max(...prior.map(c => c.high)) : recentHigh;
+  const priorHigh = Math.max(...prior.map(c => c.high));
 
   const avgVol = avg(vols.slice(0, -1));
   const priorAvgVol = avg(priorVols);
@@ -216,14 +218,30 @@ function analyze(item, candles) {
 
   const rangePct = price ? ((recentHigh - recentLow) / price) * 100 : 999;
 
-  const pullbackHeld = price > recentLow * 1.025;
-  const higherLow = lows.at(-1) > lows.at(-6);
-  const tightening = rangePct < 8;
+  const support = recentLow;
+  const breakoutLevel = Math.max(priorHigh, recentHigh);
+
+  const pullbackHeld = price > support * 1.025;
+  const higherLow = lows.at(-1) > lows.at(-8);
+  const tightening = rangePct < 7.5;
   const volumeCooling = priorAvgVol ? avgVol < priorAvgVol * 1.25 : true;
-  const breakout = price >= Math.max(priorHigh, recentHigh) * 0.995;
-  const volumeReturning = last.volume > avgVol * 1.3;
-  const noRejection = last.close > last.open;
+
+  const breakoutCandle = price > breakoutLevel * 1.002;
+  const volumeReturning = last.volume > avgVol * 1.5;
+  const greenCandle = last.close > last.open;
+  const closesStrong = last.close > ((last.high + last.low) / 2);
+  const noInstantRejection = greenCandle && closesStrong;
+
+  const retestHeld =
+    prev &&
+    prev.close >= breakoutLevel * 0.985 &&
+    last.close >= breakoutLevel * 0.995;
+
   const trendUp = closes.at(-1) > closes.at(-12);
+
+  const exhaustionRisk =
+    rangePct > 14 ||
+    (last.high - last.close) > (last.high - last.low) * 0.45;
 
   let score = 0;
   const reasons = [];
@@ -232,54 +250,84 @@ function analyze(item, candles) {
     score += 10;
     reasons.push("strong market move");
   }
+
   if (relVol >= 1.5) {
-    score += 15;
+    score += 12;
     reasons.push("relative volume elevated");
   }
+
   if (pullbackHeld) {
-    score += 15;
+    score += 12;
     reasons.push("pullback held support");
   }
+
   if (higherLow) {
-    score += 15;
+    score += 12;
     reasons.push("higher low forming");
   }
+
   if (tightening) {
     score += 10;
     reasons.push("candles tightening");
   }
+
   if (volumeCooling) {
-    score += 10;
+    score += 8;
     reasons.push("selling pressure cooling");
   }
-  if (breakout) {
+
+  if (breakoutCandle) {
     score += 15;
-    reasons.push("breakout area reached");
+    reasons.push("true breakout candle");
   }
+
   if (volumeReturning) {
     score += 15;
-    reasons.push("volume returning");
+    reasons.push("volume returning strongly");
   }
-  if (noRejection) {
+
+  if (retestHeld) {
+    score += 12;
+    reasons.push("breakout/retest holding");
+  }
+
+  if (noInstantRejection) {
     score += 10;
     reasons.push("no instant rejection");
   }
+
   if (trendUp) {
     score += 10;
     reasons.push("trend pushing higher");
   }
 
-  const stageB = pullbackHeld && higherLow && tightening;
-  const stageC = stageB && breakout && volumeReturning && noRejection;
+  if (exhaustionRisk) {
+    score -= 20;
+    reasons.push("warning: possible exhaustion/rejection wick");
+  }
+
+  const stageB =
+    pullbackHeld &&
+    higherLow &&
+    tightening &&
+    volumeCooling;
+
+  const stageC =
+    stageB &&
+    breakoutCandle &&
+    volumeReturning &&
+    noInstantRejection &&
+    retestHeld &&
+    !exhaustionRisk;
 
   return {
-    score: Math.min(score, 100),
-    setup: stageC ? "Pullback Hold Breakout" : stageB ? "Consolidation Watch" : "Discovery Watch",
+    score: Math.max(0, Math.min(score, 100)),
+    setup: stageC ? "Confirmed Breakout Continuation" : stageB ? "Consolidation Watch" : "Discovery Watch",
     stageB,
     stageC,
     price,
-    support: recentLow,
-    breakoutLevel: Math.max(priorHigh, recentHigh),
+    support,
+    breakoutLevel,
     relVol,
     reasons
   };
