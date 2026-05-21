@@ -11,12 +11,12 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const SCAN_INTERVAL_SECONDS = Number(process.env.SCAN_INTERVAL_SECONDS || 60);
-const ALERT_SCORE = Number(process.env.ALERT_SCORE || 70);
+const ALERT_SCORE = Number(process.env.ALERT_SCORE || 85);
 
-const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 5);
-const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 500000);
-const MIN_CRYPTO_GAIN = Number(process.env.MIN_CRYPTO_GAIN || 4);
-const MIN_CRYPTO_VOLUME = Number(process.env.MIN_CRYPTO_VOLUME || 1000000);
+const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 4);
+const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 300000);
+const MIN_CRYPTO_GAIN = Number(process.env.MIN_CRYPTO_GAIN || 3);
+const MIN_CRYPTO_VOLUME = Number(process.env.MIN_CRYPTO_VOLUME || 750000);
 
 const state = new Map();
 const alerted = new Set();
@@ -62,7 +62,7 @@ function alertBucket() {
 async function getYahooStockDiscovery() {
   try {
     const url =
-      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50";
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=75";
 
     const { data } = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
@@ -72,26 +72,48 @@ async function getYahooStockDiscovery() {
     const quotes = data.finance?.result?.[0]?.quotes || [];
 
     return quotes
-      .map(q => ({
-        type: "stock",
-        symbol: q.symbol,
-        price: q.regularMarketPrice || 0,
-        changePct: q.regularMarketChangePercent || 0,
-        volume: q.regularMarketVolume || 0
-      }))
-      .filter(x => x.price > 1 && x.changePct >= MIN_STOCK_GAIN && x.volume >= MIN_STOCK_VOLUME)
-      .slice(0, 35);
+      .map(q => {
+        const premarketMove = q.preMarketChangePercent || 0;
+        const regularMove = q.regularMarketChangePercent || 0;
+
+        const finalMove =
+          Math.abs(premarketMove) > Math.abs(regularMove)
+            ? premarketMove
+            : regularMove;
+
+        const finalVolume =
+          q.preMarketVolume ||
+          q.regularMarketVolume ||
+          0;
+
+        return {
+          type: "stock",
+          symbol: q.symbol,
+          price: q.regularMarketPrice || q.preMarketPrice || 0,
+          changePct: finalMove,
+          volume: finalVolume,
+          premarket: Math.abs(premarketMove) > 0,
+          marketCap: q.marketCap || null,
+          floatShares: q.sharesOutstanding || null
+        };
+      })
+      .filter(x =>
+        x.price > 1 &&
+        x.changePct >= MIN_STOCK_GAIN &&
+        x.volume >= MIN_STOCK_VOLUME
+      )
+      .sort((a, b) => b.changePct - a.changePct)
+      .slice(0, 40);
   } catch (err) {
     console.log("Yahoo stock discovery error:", err.message);
     return [];
   }
 }
 
-async function getYahooCandles(symbol) {
+async function getYahooCandles(symbol, interval = "5m") {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-      symbol
-    )}?range=5d&interval=5m`;
+    const range = interval === "1m" ? "1d" : interval === "15m" ? "5d" : "5d";
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`;
 
     const { data } = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
@@ -104,7 +126,7 @@ async function getYahooCandles(symbol) {
     const q = result.indicators?.quote?.[0] || {};
     const ts = result.timestamp || [];
 
-    const candles = ts
+    return ts
       .map((time, i) => ({
         time,
         open: q.open?.[i],
@@ -119,10 +141,8 @@ async function getYahooCandles(symbol) {
         Number.isFinite(c.low) &&
         Number.isFinite(c.close)
       );
-
-    return candles;
   } catch (err) {
-    console.log(`Yahoo candle error ${symbol}:`, err.message);
+    console.log(`Yahoo candle error ${symbol} ${interval}:`, err.message);
     return null;
   }
 }
@@ -142,9 +162,9 @@ const CRYPTO_PRODUCTS = [
   "PEPE-USD"
 ];
 
-async function getCoinbaseCandles(symbol) {
+async function getCoinbaseCandles(symbol, granularity = 300) {
   try {
-    const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=300`;
+    const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=${granularity}`;
 
     const { data } = await axios.get(url, { timeout: 15000 });
 
@@ -168,8 +188,8 @@ async function getCryptoDiscovery() {
   const movers = [];
 
   for (const symbol of CRYPTO_PRODUCTS) {
-    const candles = await getCoinbaseCandles(symbol);
-    if (!candles || candles.length < 25) continue;
+    const candles = await getCoinbaseCandles(symbol, 300);
+    if (!candles || candles.length < 30) continue;
 
     const recent = candles.slice(-24);
     const first = recent[0].close;
@@ -184,6 +204,9 @@ async function getCryptoDiscovery() {
         price: last,
         changePct,
         volume: dollarVolume,
+        premarket: false,
+        marketCap: null,
+        floatShares: null,
         candles
       });
     }
@@ -192,7 +215,31 @@ async function getCryptoDiscovery() {
   return movers.sort((a, b) => b.changePct - a.changePct);
 }
 
-function analyze(item, candles) {
+function trendCheck(candles) {
+  if (!candles || candles.length < 20) {
+    return {
+      shortTrend: false,
+      mediumTrend: false,
+      longTrend: false,
+      aligned: false
+    };
+  }
+
+  const closes = candles.map(c => c.close);
+
+  const shortTrend = closes.at(-1) > closes.at(-4);
+  const mediumTrend = closes.at(-1) > closes.at(-12);
+  const longTrend = closes.at(-1) > closes.at(-20);
+
+  return {
+    shortTrend,
+    mediumTrend,
+    longTrend,
+    aligned: shortTrend && mediumTrend && longTrend
+  };
+}
+
+function analyze(item, candles, candles1m = null, candles15m = null) {
   if (!candles || candles.length < 50) return null;
 
   const recent = candles.slice(-24);
@@ -214,7 +261,8 @@ function analyze(item, candles) {
 
   const avgVol = avg(vols.slice(0, -1));
   const priorAvgVol = avg(priorVols);
-  const relVol = priorAvgVol ? avgVol / priorAvgVol : 1;
+  const rawRelVol = priorAvgVol > 0 ? avgVol / priorAvgVol : 1;
+  const relVol = Math.min(rawRelVol, 15);
 
   const rangePct = price ? ((recentHigh - recentLow) / price) * 100 : 999;
 
@@ -237,23 +285,62 @@ function analyze(item, candles) {
     prev.close >= breakoutLevel * 0.985 &&
     last.close >= breakoutLevel * 0.995;
 
-  const trendUp = closes.at(-1) > closes.at(-12);
+  const fiveMinTrend = trendCheck(candles);
+  const oneMinTrend = trendCheck(candles1m);
+  const fifteenMinTrend = trendCheck(candles15m);
+
+  const multiTimeframeAligned =
+    fiveMinTrend.aligned &&
+    (!candles1m || oneMinTrend.shortTrend) &&
+    (!candles15m || fifteenMinTrend.mediumTrend || fifteenMinTrend.longTrend);
+
+  const lowFloat =
+    item.type === "stock" &&
+    item.floatShares &&
+    item.floatShares < 20_000_000;
+
+  const mediumFloat =
+    item.type === "stock" &&
+    item.floatShares &&
+    item.floatShares >= 20_000_000 &&
+    item.floatShares < 100_000_000;
+
+  const overextended = item.changePct > 35;
 
   const exhaustionRisk =
     rangePct > 14 ||
-    (last.high - last.close) > (last.high - last.low) * 0.45;
+    (last.high - last.close) > (last.high - last.low) * 0.45 ||
+    overextended;
+
+  const catalystPlaceholder =
+    item.changePct >= 12 || item.premarket;
 
   let score = 0;
   const reasons = [];
+
+  if (item.premarket) {
+    score += 8;
+    reasons.push("premarket mover");
+  }
 
   if (item.changePct >= 4) {
     score += 10;
     reasons.push("strong market move");
   }
 
+  if (item.changePct >= 10) {
+    score += 8;
+    reasons.push("major momentum move");
+  }
+
   if (relVol >= 1.5) {
     score += 12;
     reasons.push("relative volume elevated");
+  }
+
+  if (relVol >= 3) {
+    score += 10;
+    reasons.push("unusual relative volume");
   }
 
   if (pullbackHeld) {
@@ -296,14 +383,32 @@ function analyze(item, candles) {
     reasons.push("no instant rejection");
   }
 
-  if (trendUp) {
+  if (fiveMinTrend.aligned) {
     score += 10;
-    reasons.push("trend pushing higher");
+    reasons.push("5m trend aligned");
+  }
+
+  if (multiTimeframeAligned) {
+    score += 15;
+    reasons.push("multi-timeframe trend alignment");
+  }
+
+  if (lowFloat) {
+    score += 10;
+    reasons.push("low float squeeze potential");
+  } else if (mediumFloat) {
+    score += 5;
+    reasons.push("medium float momentum profile");
+  }
+
+  if (catalystPlaceholder) {
+    score += 5;
+    reasons.push("possible catalyst/news runner");
   }
 
   if (exhaustionRisk) {
     score -= 20;
-    reasons.push("warning: possible exhaustion/rejection wick");
+    reasons.push("warning: possible exhaustion or rejection risk");
   }
 
   const stageB =
@@ -318,7 +423,12 @@ function analyze(item, candles) {
     volumeReturning &&
     noInstantRejection &&
     retestHeld &&
-    !exhaustionRisk;
+    !exhaustionRisk &&
+    relVol >= 1.2;
+
+  let risk = "Normal";
+  if (item.changePct > 25 || rangePct > 10 || lowFloat) risk = "High volatility";
+  if (exhaustionRisk) risk = "High rejection risk";
 
   return {
     score: Math.max(0, Math.min(score, 100)),
@@ -329,21 +439,38 @@ function analyze(item, candles) {
     support,
     breakoutLevel,
     relVol,
+    rawRelVol,
+    rangePct,
+    lowFloat,
+    mediumFloat,
+    multiTimeframeAligned,
+    risk,
     reasons
   };
 }
 
 async function processItem(item) {
-  let candles = item.candles;
+  let candles5m = item.candles;
+  let candles1m = null;
+  let candles15m = null;
 
   if (item.type === "stock") {
-    candles = await getYahooCandles(item.symbol);
+    candles5m = await getYahooCandles(item.symbol, "5m");
+    candles1m = await getYahooCandles(item.symbol, "1m");
+    candles15m = await getYahooCandles(item.symbol, "15m");
   }
 
-  if (!candles) return;
+  if (item.type === "crypto") {
+    candles1m = await getCoinbaseCandles(item.symbol, 60);
+    candles15m = await getCoinbaseCandles(item.symbol, 900);
+  }
 
-  const result = analyze(item, candles);
+  if (!candles5m) return;
+
+  const result = analyze(item, candles5m, candles1m, candles15m);
   if (!result) return;
+
+  if (result.score < 60) return;
 
   const key = `${item.type}:${item.symbol}`;
 
@@ -354,7 +481,7 @@ async function processItem(item) {
   });
 
   console.log(
-    `${item.type.toUpperCase()} ${item.symbol} | ${result.setup} | Score ${result.score} | Move ${item.changePct.toFixed(2)}%`
+    `${item.type.toUpperCase()} ${item.symbol} | ${result.setup} | Score ${result.score} | Move ${item.changePct.toFixed(2)}% | RVOL ${result.relVol.toFixed(2)}x`
   );
 
   const alertKey = `${key}:${alertBucket()}`;
@@ -369,28 +496,33 @@ async function processItem(item) {
         : `https://www.coinbase.com/advanced-trade/spot/${item.symbol}`;
 
     await sendTelegram(
-`🚨 CARDINAL ${item.type.toUpperCase()} STRONG SETUP
+`🚨 CARDINAL ANALYTICS ALERT
 
 ${item.symbol}
+Asset: ${item.type.toUpperCase()}
+Stage: BREAKOUT CONFIRMED
 Setup: ${result.setup}
 Score: ${result.score}/100
+Risk: ${result.risk}
 
 Price: ${fmtMoney(result.price, decimals)}
 Move: ${item.changePct.toFixed(2)}%
+Premarket: ${item.premarket ? "YES" : "NO"}
 Volume: ${fmtVol(item.volume)}
 Relative Volume: ${result.relVol.toFixed(2)}x
 
 Support: ${fmtMoney(result.support, decimals)}
 Breakout: ${fmtMoney(result.breakoutLevel, decimals)}
 
-Why it alerted:
+Structure:
 ${result.reasons.map(r => `- ${r}`).join("\n")}
 
 Game plan:
-- Do NOT chase the first candle
-- Look for breakout hold or pullback hold
+- Do NOT chase if it is already extended
+- Best entry is breakout hold or pullback hold
 - Cut if it loses support/VWAP area
-- Best setups hold higher lows with volume returning
+- Size smaller on high-volatility names
+- Avoid if volume fades after alert
 
 ${link}
 
@@ -400,7 +532,7 @@ Not financial advice.`
 }
 
 async function scanAll() {
-  console.log("CARDINAL ANALYTICS 3-STAGE SCANNER RUNNING...");
+  console.log("CARDINAL ANALYTICS V1 SCANNER RUNNING...");
 
   const stocks = await getYahooStockDiscovery();
   const crypto = await getCryptoDiscovery();
@@ -420,13 +552,13 @@ async function scanAll() {
 }
 
 app.get("/", (req, res) => {
-  res.send("Cardinal Analytics Stock + Crypto Scanner Running");
+  res.send("Cardinal Analytics V1 Stock + Crypto Scanner Running");
 });
 
 app.get("/health", (req, res) => {
   res.json({
     status: "online",
-    scanner: "stock_crypto_3_stage_no_polygon",
+    scanner: "cardinal_analytics_v1_stock_crypto",
     interval: SCAN_INTERVAL_SECONDS,
     alertScore: ALERT_SCORE,
     tracked: state.size,
@@ -442,8 +574,13 @@ app.get("/watchlist", (req, res) => {
     price: value.analysis.price,
     score: value.analysis.score,
     setup: value.analysis.setup,
+    risk: value.analysis.risk,
+    premarket: value.premarket,
+    relativeVolume: value.analysis.relVol,
     support: value.analysis.support,
     breakout: value.analysis.breakoutLevel,
+    lowFloat: value.analysis.lowFloat,
+    multiTimeframeAligned: value.analysis.multiTimeframeAligned,
     reasons: value.analysis.reasons,
     updated: value.updated
   }));
