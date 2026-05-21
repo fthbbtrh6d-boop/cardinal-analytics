@@ -9,30 +9,20 @@ const PORT = process.env.PORT || 3000;
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 
 const SCAN_INTERVAL_SECONDS = Number(process.env.SCAN_INTERVAL_SECONDS || 60);
 const ALERT_SCORE = Number(process.env.ALERT_SCORE || 70);
 
 const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 5);
 const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 500000);
-const MIN_RELATIVE_VOLUME = Number(process.env.MIN_RELATIVE_VOLUME || 2);
-
 const MIN_CRYPTO_GAIN = Number(process.env.MIN_CRYPTO_GAIN || 4);
 const MIN_CRYPTO_VOLUME = Number(process.env.MIN_CRYPTO_VOLUME || 1000000);
 
 const state = new Map();
-const alerted = new Map();
-
-function nowBucket(minutes = 30) {
-  return Math.floor(Date.now() / (minutes * 60 * 1000));
-}
+const alerted = new Set();
 
 async function sendTelegram(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log("Missing Telegram env vars");
-    return;
-  }
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
   try {
     await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -41,77 +31,45 @@ async function sendTelegram(message) {
       disable_web_page_preview: false
     });
   } catch (err) {
-    console.log("Telegram Error:", err.response?.data || err.message);
+    console.log("Telegram error:", err.response?.data || err.message);
   }
 }
 
-function sma(values) {
-  if (!values.length) return 0;
-  return values.reduce((a, b) => a + b, 0) / values.length;
+function avg(arr) {
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 }
 
-function pctChange(current, previous) {
-  if (!previous) return 0;
-  return ((current - previous) / previous) * 100;
+function pct(current, previous) {
+  return previous ? ((current - previous) / previous) * 100 : 0;
 }
 
-function getCandlesFromYahooResult(result) {
-  const quote = result.indicators?.quote?.[0] || {};
-  const timestamps = result.timestamp || [];
-
-  const candles = timestamps.map((t, i) => ({
-    time: t,
-    open: quote.open?.[i],
-    high: quote.high?.[i],
-    low: quote.low?.[i],
-    close: quote.close?.[i],
-    volume: quote.volume?.[i]
-  })).filter(c =>
-    typeof c.open === "number" &&
-    typeof c.high === "number" &&
-    typeof c.low === "number" &&
-    typeof c.close === "number"
-  );
-
-  return candles;
+function fmtMoney(n, decimals = 2) {
+  return Number.isFinite(n) ? `$${n.toFixed(decimals)}` : "N/A";
 }
 
-async function getYahooCandles(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=5d&interval=5m`;
-
-  const { data } = await axios.get(url, {
-    headers: { "User-Agent": "Mozilla/5.0" },
-    timeout: 10000
-  });
-
-  const result = data.chart?.result?.[0];
-  if (!result) return null;
-
-  const candles = getCandlesFromYahooResult(result);
-  const meta = result.meta || {};
-
-  return {
-    symbol,
-    price: meta.regularMarketPrice || candles.at(-1)?.close,
-    previousClose: meta.chartPreviousClose || meta.previousClose,
-    candles
-  };
+function fmtVol(n) {
+  if (!Number.isFinite(n)) return "N/A";
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
+  return `${Math.round(n)}`;
 }
 
-async function getPolygonStockDiscovery() {
+function alertBucket() {
+  return Math.floor(Date.now() / (30 * 60 * 1000));
+}
+
+async function getYahooStockDiscovery() {
   try {
     const url =
-      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25";
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=50";
 
     const { data } = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0"
-      },
+      headers: { "User-Agent": "Mozilla/5.0" },
       timeout: 15000
     });
 
-    const quotes =
-      data.finance?.result?.[0]?.quotes || [];
+    const quotes = data.finance?.result?.[0]?.quotes || [];
 
     return quotes
       .map(q => ({
@@ -121,285 +79,242 @@ async function getPolygonStockDiscovery() {
         changePct: q.regularMarketChangePercent || 0,
         volume: q.regularMarketVolume || 0
       }))
-      .filter(x =>
-        x.price > 1 &&
-        x.changePct >= MIN_STOCK_GAIN &&
-        x.volume >= MIN_STOCK_VOLUME
-      )
-      .sort((a, b) => b.changePct - a.changePct)
+      .filter(x => x.price > 1 && x.changePct >= MIN_STOCK_GAIN && x.volume >= MIN_STOCK_VOLUME)
       .slice(0, 35);
-
   } catch (err) {
-    console.log("Yahoo discovery error:", err.message);
+    console.log("Yahoo stock discovery error:", err.message);
     return [];
   }
 }
 
-  const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_API_KEY}`;
+async function getYahooCandles(symbol) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+      symbol
+    )}?range=5d&interval=5m`;
 
-  const { data } = await axios.get(url, { timeout: 15000 });
+    const { data } = await axios.get(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      timeout: 15000
+    });
 
-  const tickers = data.tickers || [];
+    const result = data.chart?.result?.[0];
+    if (!result) return null;
 
-  return tickers
-    .map(t => {
-      const day = t.day || {};
-      const prevDay = t.prevDay || {};
-      const lastTrade = t.lastTrade || {};
-      const price = lastTrade.p || day.c || 0;
-      const prevClose = prevDay.c || 0;
-      const changePct = pctChange(price, prevClose);
-      const volume = day.v || 0;
+    const q = result.indicators?.quote?.[0] || {};
+    const ts = result.timestamp || [];
 
-      return {
-        type: "stock",
-        symbol: t.ticker,
-        price,
-        changePct,
-        volume
-      };
-    })
-    .filter(x =>
-      x.price > 0 &&
-      x.changePct >= MIN_STOCK_GAIN &&
-      x.volume >= MIN_STOCK_VOLUME
-    )
-    .sort((a, b) => b.changePct - a.changePct)
-    .slice(0, 35);
+    const candles = ts
+      .map((time, i) => ({
+        time,
+        open: q.open?.[i],
+        high: q.high?.[i],
+        low: q.low?.[i],
+        close: q.close?.[i],
+        volume: q.volume?.[i] || 0
+      }))
+      .filter(c =>
+        Number.isFinite(c.open) &&
+        Number.isFinite(c.high) &&
+        Number.isFinite(c.low) &&
+        Number.isFinite(c.close)
+      );
+
+    return candles;
+  } catch (err) {
+    console.log(`Yahoo candle error ${symbol}:`, err.message);
+    return null;
+  }
 }
 
-async function getCoinbaseProducts() {
-  const { data } = await axios.get("https://api.exchange.coinbase.com/products", {
-    timeout: 10000
-  });
-
-  return data
-    .filter(p =>
-      p.quote_currency === "USD" &&
-      !p.trading_disabled &&
-      ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "AVAX-USD", "LINK-USD", "ADA-USD", "SUI-USD", "LTC-USD", "BCH-USD", "PEPE-USD"].includes(p.id)
-    )
-    .map(p => p.id);
-}
+const CRYPTO_PRODUCTS = [
+  "BTC-USD",
+  "ETH-USD",
+  "SOL-USD",
+  "XRP-USD",
+  "DOGE-USD",
+  "AVAX-USD",
+  "LINK-USD",
+  "ADA-USD",
+  "SUI-USD",
+  "LTC-USD",
+  "BCH-USD",
+  "PEPE-USD"
+];
 
 async function getCoinbaseCandles(symbol) {
-  const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=300`;
+  try {
+    const url = `https://api.exchange.coinbase.com/products/${symbol}/candles?granularity=300`;
 
-  const { data } = await axios.get(url, { timeout: 10000 });
+    const { data } = await axios.get(url, { timeout: 15000 });
 
-  const candles = data
-    .map(c => ({
-      time: c[0],
-      low: c[1],
-      high: c[2],
-      open: c[3],
-      close: c[4],
-      volume: c[5]
-    }))
-    .sort((a, b) => a.time - b.time);
-
-  const price = candles.at(-1)?.close;
-
-  return {
-    symbol,
-    price,
-    candles
-  };
+    return data
+      .map(c => ({
+        time: c[0],
+        low: c[1],
+        high: c[2],
+        open: c[3],
+        close: c[4],
+        volume: c[5]
+      }))
+      .sort((a, b) => a.time - b.time);
+  } catch (err) {
+    console.log(`Coinbase candle error ${symbol}:`, err.response?.status || err.message);
+    return null;
+  }
 }
 
 async function getCryptoDiscovery() {
-  const products = await getCoinbaseProducts();
-  const results = [];
+  const movers = [];
 
-  for (const symbol of products) {
-    try {
-      const data = await getCoinbaseCandles(symbol);
-      const candles = data.candles;
-      if (candles.length < 20) continue;
+  for (const symbol of CRYPTO_PRODUCTS) {
+    const candles = await getCoinbaseCandles(symbol);
+    if (!candles || candles.length < 25) continue;
 
-      const first = candles.at(-20).close;
-      const last = candles.at(-1).close;
-      const changePct = pctChange(last, first);
-      const volume = candles.slice(-12).reduce((sum, c) => sum + (c.volume * c.close), 0);
+    const recent = candles.slice(-24);
+    const first = recent[0].close;
+    const last = recent.at(-1).close;
+    const changePct = pct(last, first);
+    const dollarVolume = recent.reduce((sum, c) => sum + c.volume * c.close, 0);
 
-      if (changePct >= MIN_CRYPTO_GAIN && volume >= MIN_CRYPTO_VOLUME) {
-        results.push({
-          type: "crypto",
-          symbol,
-          price: last,
-          changePct,
-          volume
-        });
-      }
-    } catch (err) {
-      console.log(`Crypto discovery error ${symbol}:`, err.response?.status || err.message);
+    if (changePct >= MIN_CRYPTO_GAIN && dollarVolume >= MIN_CRYPTO_VOLUME) {
+      movers.push({
+        type: "crypto",
+        symbol,
+        price: last,
+        changePct,
+        volume: dollarVolume,
+        candles
+      });
     }
   }
 
-  return results.sort((a, b) => b.changePct - a.changePct).slice(0, 25);
+  return movers.sort((a, b) => b.changePct - a.changePct);
 }
 
-function analyzeSetup(item, candles) {
-  if (!candles || candles.length < 25) return null;
+function analyze(item, candles) {
+  if (!candles || candles.length < 30) return null;
 
   const recent = candles.slice(-24);
   const prior = candles.slice(-48, -24);
-  const last = recent.at(-1);
 
+  const last = recent.at(-1);
   const closes = recent.map(c => c.close);
   const highs = recent.map(c => c.high);
   const lows = recent.map(c => c.low);
-  const volumes = recent.map(c => c.volume || 0);
-  const priorVolumes = prior.map(c => c.volume || 0);
+  const vols = recent.map(c => c.volume || 0);
+  const priorVols = prior.map(c => c.volume || 0);
 
+  const price = last.close;
   const recentHigh = Math.max(...highs);
   const recentLow = Math.min(...lows);
   const priorHigh = prior.length ? Math.max(...prior.map(c => c.high)) : recentHigh;
-  const avgVol = sma(volumes.slice(0, -1));
-  const priorAvgVol = sma(priorVolumes);
+
+  const avgVol = avg(vols.slice(0, -1));
+  const priorAvgVol = avg(priorVols);
   const relVol = priorAvgVol ? avgVol / priorAvgVol : 1;
 
-  const price = last.close;
-  const range = recentHigh - recentLow;
-  const rangePct = price ? (range / price) * 100 : 999;
+  const rangePct = price ? ((recentHigh - recentLow) / price) * 100 : 999;
 
-  const higherLow = lows.at(-1) > lows.at(-6);
   const pullbackHeld = price > recentLow * 1.025;
+  const higherLow = lows.at(-1) > lows.at(-6);
   const tightening = rangePct < 8;
-  const volumeCooling = avgVol < priorAvgVol * 1.2;
-  const volumeReturning = last.volume > avgVol * 1.35;
-  const breakout = price > priorHigh * 1.002 || price >= recentHigh * 0.995;
-  const noInstantRejection = price > (last.open || price);
+  const volumeCooling = priorAvgVol ? avgVol < priorAvgVol * 1.25 : true;
+  const breakout = price >= Math.max(priorHigh, recentHigh) * 0.995;
+  const volumeReturning = last.volume > avgVol * 1.3;
+  const noRejection = last.close > last.open;
   const trendUp = closes.at(-1) > closes.at(-12);
 
   let score = 0;
   const reasons = [];
 
-  if (item.changePct >= 5) {
+  if (item.changePct >= 4) {
     score += 10;
     reasons.push("strong market move");
   }
-
-  if (relVol >= MIN_RELATIVE_VOLUME) {
+  if (relVol >= 1.5) {
     score += 15;
     reasons.push("relative volume elevated");
   }
-
   if (pullbackHeld) {
     score += 15;
     reasons.push("pullback held support");
   }
-
   if (higherLow) {
     score += 15;
     reasons.push("higher low forming");
   }
-
   if (tightening) {
     score += 10;
     reasons.push("candles tightening");
   }
-
   if (volumeCooling) {
     score += 10;
     reasons.push("selling pressure cooling");
   }
-
   if (breakout) {
     score += 15;
     reasons.push("breakout area reached");
   }
-
   if (volumeReturning) {
     score += 15;
     reasons.push("volume returning");
   }
-
-  if (noInstantRejection) {
+  if (noRejection) {
     score += 10;
     reasons.push("no instant rejection");
   }
-
   if (trendUp) {
     score += 10;
-    reasons.push("trend still pushing higher");
+    reasons.push("trend pushing higher");
   }
 
-  const stageB =
-    pullbackHeld &&
-    higherLow &&
-    tightening &&
-    volumeCooling;
-
-  const stageC =
-    stageB &&
-    breakout &&
-    volumeReturning &&
-    noInstantRejection;
+  const stageB = pullbackHeld && higherLow && tightening;
+  const stageC = stageB && breakout && volumeReturning && noRejection;
 
   return {
     score: Math.min(score, 100),
-    reasons,
+    setup: stageC ? "Pullback Hold Breakout" : stageB ? "Consolidation Watch" : "Discovery Watch",
+    stageB,
+    stageC,
     price,
     support: recentLow,
     breakoutLevel: Math.max(priorHigh, recentHigh),
     relVol,
-    stageB,
-    stageC,
-    setupName: stageC ? "Pullback Hold Breakout" : stageB ? "Consolidation Watch" : "Discovery Watch"
+    reasons
   };
 }
 
-async function hydrateItem(item) {
+async function processItem(item) {
+  let candles = item.candles;
+
   if (item.type === "stock") {
-    const data = await getYahooCandles(item.symbol);
-    return data?.candles ? { ...item, candles: data.candles, price: data.price || item.price } : null;
+    candles = await getYahooCandles(item.symbol);
   }
 
-  if (item.type === "crypto") {
-    const data = await getCoinbaseCandles(item.symbol);
-    return data?.candles ? { ...item, candles: data.candles, price: data.price || item.price } : null;
-  }
+  if (!candles) return;
 
-  return null;
-}
-
-function formatMoney(n, decimals = 2) {
-  if (!Number.isFinite(n)) return "N/A";
-  return `$${n.toFixed(decimals)}`;
-}
-
-function formatVolume(n) {
-  if (!Number.isFinite(n)) return "N/A";
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
-  return `${Math.round(n)}`;
-}
-
-async function processMarketItem(item) {
-  const hydrated = await hydrateItem(item);
-  if (!hydrated) return null;
-
-  const analysis = analyzeSetup(hydrated, hydrated.candles);
-  if (!analysis) return null;
+  const result = analyze(item, candles);
+  if (!result) return;
 
   const key = `${item.type}:${item.symbol}`;
+
   state.set(key, {
-    ...hydrated,
-    analysis,
-    lastUpdated: new Date().toISOString()
+    ...item,
+    analysis: result,
+    updated: new Date().toISOString()
   });
 
   console.log(
-    `${item.type.toUpperCase()} ${item.symbol} | ${analysis.setupName} | Score ${analysis.score} | Move ${item.changePct.toFixed(2)}%`
+    `${item.type.toUpperCase()} ${item.symbol} | ${result.setup} | Score ${result.score} | Move ${item.changePct.toFixed(2)}%`
   );
 
-  const alertKey = `${key}:${nowBucket(30)}`;
+  const alertKey = `${key}:${alertBucket()}`;
 
-  if (analysis.stageC && analysis.score >= ALERT_SCORE && !alerted.has(alertKey)) {
-    alerted.set(alertKey, Date.now());
+  if (result.stageC && result.score >= ALERT_SCORE && !alerted.has(alertKey)) {
+    alerted.add(alertKey);
 
+    const decimals = item.type === "crypto" ? 4 : 2;
     const link =
       item.type === "stock"
         ? `https://finance.yahoo.com/quote/${item.symbol}`
@@ -409,19 +324,19 @@ async function processMarketItem(item) {
 `🚨 CARDINAL ${item.type.toUpperCase()} STRONG SETUP
 
 ${item.symbol}
-Setup: ${analysis.setupName}
-Score: ${analysis.score}/100
+Setup: ${result.setup}
+Score: ${result.score}/100
 
-Price: ${formatMoney(analysis.price, item.type === "crypto" ? 4 : 2)}
+Price: ${fmtMoney(result.price, decimals)}
 Move: ${item.changePct.toFixed(2)}%
-Volume: ${formatVolume(item.volume)}
-Relative Volume: ${analysis.relVol.toFixed(2)}x
+Volume: ${fmtVol(item.volume)}
+Relative Volume: ${result.relVol.toFixed(2)}x
 
-Support: ${formatMoney(analysis.support, item.type === "crypto" ? 4 : 2)}
-Breakout: ${formatMoney(analysis.breakoutLevel, item.type === "crypto" ? 4 : 2)}
+Support: ${fmtMoney(result.support, decimals)}
+Breakout: ${fmtMoney(result.breakoutLevel, decimals)}
 
 Why it alerted:
-${analysis.reasons.map(r => `- ${r}`).join("\n")}
+${result.reasons.map(r => `- ${r}`).join("\n")}
 
 Game plan:
 - Do NOT chase the first candle
@@ -434,47 +349,40 @@ ${link}
 Not financial advice.`
     );
   }
-
-  return { item, analysis };
 }
 
 async function scanAll() {
   console.log("CARDINAL ANALYTICS 3-STAGE SCANNER RUNNING...");
 
-  try {
-    const stocks = await getPolygonStockDiscovery();
-    const crypto = await getCryptoDiscovery();
+  const stocks = await getYahooStockDiscovery();
+  const crypto = await getCryptoDiscovery();
+  const discovery = [...stocks, ...crypto];
 
-    const discovery = [...stocks, ...crypto];
+  console.log(`Stage A Discovery Found: ${discovery.length} movers`);
 
-    console.log(`Stage A Discovery Found: ${discovery.length} movers`);
-
-    for (const item of discovery) {
-      try {
-        await processMarketItem(item);
-      } catch (err) {
-        console.log(`Process error ${item.symbol}:`, err.response?.status || err.message);
-      }
+  for (const item of discovery) {
+    try {
+      await processItem(item);
+    } catch (err) {
+      console.log(`Process error ${item.symbol}:`, err.message);
     }
-
-    console.log("SCAN COMPLETE");
-  } catch (err) {
-    console.log("Scan error:", err.response?.data || err.message);
   }
+
+  console.log("SCAN COMPLETE");
 }
 
 app.get("/", (req, res) => {
-  res.send("Cardinal Analytics 3-Stage Stock + Crypto Scanner Running");
+  res.send("Cardinal Analytics Stock + Crypto Scanner Running");
 });
 
 app.get("/health", (req, res) => {
   res.json({
     status: "online",
-    scanner: "3_stage_stock_crypto_scanner",
-    scanInterval: SCAN_INTERVAL_SECONDS,
+    scanner: "stock_crypto_3_stage_no_polygon",
+    interval: SCAN_INTERVAL_SECONDS,
     alertScore: ALERT_SCORE,
-    trackedSetups: state.size,
-    lastScan: new Date().toISOString()
+    tracked: state.size,
+    lastChecked: new Date().toISOString()
   });
 });
 
@@ -485,11 +393,11 @@ app.get("/watchlist", (req, res) => {
     type: value.type,
     price: value.analysis.price,
     score: value.analysis.score,
-    setup: value.analysis.setupName,
+    setup: value.analysis.setup,
     support: value.analysis.support,
     breakout: value.analysis.breakoutLevel,
     reasons: value.analysis.reasons,
-    updated: value.lastUpdated
+    updated: value.updated
   }));
 
   res.json(data.sort((a, b) => b.score - a.score));
