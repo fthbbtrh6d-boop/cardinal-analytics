@@ -18,8 +18,12 @@ const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 300000);
 const MIN_CRYPTO_GAIN = Number(process.env.MIN_CRYPTO_GAIN || 3);
 const MIN_CRYPTO_VOLUME = Number(process.env.MIN_CRYPTO_VOLUME || 750000);
 
+const MIN_ELITE_SCORE = Number(process.env.MIN_ELITE_SCORE || ALERT_SCORE);
+const MIN_ELITE_RVOL = Number(process.env.MIN_ELITE_RVOL || 1.5);
+const ALERT_COOLDOWN_MINUTES = Number(process.env.ALERT_COOLDOWN_MINUTES || 45);
+
 const state = new Map();
-const alerted = new Set();
+const alertMemory = new Map();
 
 async function sendTelegram(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -55,8 +59,31 @@ function fmtVol(n) {
   return `${Math.round(n)}`;
 }
 
-function alertBucket() {
-  return Math.floor(Date.now() / (30 * 60 * 1000));
+function shouldSendEliteAlert(item, result, key) {
+  const now = Date.now();
+  const previous = alertMemory.get(key);
+
+  const cooldownExpired =
+    !previous || now - previous.time > ALERT_COOLDOWN_MINUTES * 60 * 1000;
+
+  const scoreImproved =
+    !previous || result.score >= previous.score + 7;
+
+  const eliteStructure =
+    result.stageC &&
+    result.score >= MIN_ELITE_SCORE &&
+    result.relVol >= MIN_ELITE_RVOL &&
+    result.risk !== "High rejection risk";
+
+  const strongEnoughWithoutPerfectMTF =
+    result.score >= 92 &&
+    result.stageC &&
+    result.relVol >= 1.3;
+
+  const multiTimeframePass =
+    result.multiTimeframeAligned || strongEnoughWithoutPerfectMTF;
+
+  return eliteStructure && multiTimeframePass && (cooldownExpired || scoreImproved);
 }
 
 async function getYahooStockDiscovery() {
@@ -112,7 +139,7 @@ async function getYahooStockDiscovery() {
 
 async function getYahooCandles(symbol, interval = "5m") {
   try {
-    const range = interval === "1m" ? "1d" : interval === "15m" ? "5d" : "5d";
+    const range = interval === "1m" ? "1d" : "5d";
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}`;
 
     const { data } = await axios.get(url, {
@@ -248,7 +275,6 @@ function analyze(item, candles, candles1m = null, candles15m = null) {
   const last = recent.at(-1);
   const prev = recent.at(-2);
 
-  const closes = recent.map(c => c.close);
   const highs = recent.map(c => c.high);
   const lows = recent.map(c => c.low);
   const vols = recent.map(c => c.volume || 0);
@@ -481,13 +507,16 @@ async function processItem(item) {
   });
 
   console.log(
-    `${item.type.toUpperCase()} ${item.symbol} | ${result.setup} | Score ${result.score} | Move ${item.changePct.toFixed(2)}% | RVOL ${result.relVol.toFixed(2)}x`
+    `${item.type.toUpperCase()} ${item.symbol} | ${result.setup} | Score ${result.score} | Move ${item.changePct.toFixed(2)}% | RVOL ${result.relVol.toFixed(2)}x | Risk ${result.risk}`
   );
 
-  const alertKey = `${key}:${alertBucket()}`;
-
-  if (result.stageC && result.score >= ALERT_SCORE && !alerted.has(alertKey)) {
-    alerted.add(alertKey);
+  if (shouldSendEliteAlert(item, result, key)) {
+    alertMemory.set(key, {
+      time: Date.now(),
+      score: result.score,
+      price: result.price,
+      setup: result.setup
+    });
 
     const decimals = item.type === "crypto" ? 4 : 2;
     const link =
@@ -496,13 +525,13 @@ async function processItem(item) {
         : `https://www.coinbase.com/advanced-trade/spot/${item.symbol}`;
 
     await sendTelegram(
-`🚨 CARDINAL ANALYTICS ALERT
+`🚨 CARDINAL ANALYTICS ELITE ALERT
 
 ${item.symbol}
 Asset: ${item.type.toUpperCase()}
 Stage: BREAKOUT CONFIRMED
 Setup: ${result.setup}
-Score: ${result.score}/100
+Confidence Score: ${result.score}/100
 Risk: ${result.risk}
 
 Price: ${fmtMoney(result.price, decimals)}
@@ -514,10 +543,10 @@ Relative Volume: ${result.relVol.toFixed(2)}x
 Support: ${fmtMoney(result.support, decimals)}
 Breakout: ${fmtMoney(result.breakoutLevel, decimals)}
 
-Structure:
+Why this matters:
 ${result.reasons.map(r => `- ${r}`).join("\n")}
 
-Game plan:
+Trade plan:
 - Do NOT chase if it is already extended
 - Best entry is breakout hold or pullback hold
 - Cut if it loses support/VWAP area
@@ -532,7 +561,7 @@ Not financial advice.`
 }
 
 async function scanAll() {
-  console.log("CARDINAL ANALYTICS V1 SCANNER RUNNING...");
+  console.log("CARDINAL ANALYTICS PHASE 2 SCANNER RUNNING...");
 
   const stocks = await getYahooStockDiscovery();
   const crypto = await getCryptoDiscovery();
@@ -552,15 +581,18 @@ async function scanAll() {
 }
 
 app.get("/", (req, res) => {
-  res.send("Cardinal Analytics V1 Stock + Crypto Scanner Running");
+  res.send("Cardinal Analytics Phase 2 Stock + Crypto Scanner Running");
 });
 
 app.get("/health", (req, res) => {
   res.json({
     status: "online",
-    scanner: "cardinal_analytics_v1_stock_crypto",
+    scanner: "cardinal_analytics_phase_2_stock_crypto",
     interval: SCAN_INTERVAL_SECONDS,
     alertScore: ALERT_SCORE,
+    minEliteScore: MIN_ELITE_SCORE,
+    minEliteRvol: MIN_ELITE_RVOL,
+    alertCooldownMinutes: ALERT_COOLDOWN_MINUTES,
     tracked: state.size,
     lastChecked: new Date().toISOString()
   });
@@ -580,6 +612,7 @@ app.get("/watchlist", (req, res) => {
     support: value.analysis.support,
     breakout: value.analysis.breakoutLevel,
     lowFloat: value.analysis.lowFloat,
+    mediumFloat: value.analysis.mediumFloat,
     multiTimeframeAligned: value.analysis.multiTimeframeAligned,
     reasons: value.analysis.reasons,
     updated: value.updated
