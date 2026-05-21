@@ -99,10 +99,41 @@ async function getYahooCandles(symbol) {
 }
 
 async function getPolygonStockDiscovery() {
-  if (!POLYGON_API_KEY) {
-    console.log("Missing POLYGON_API_KEY");
+  try {
+    const url =
+      "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=25";
+
+    const { data } = await axios.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      },
+      timeout: 15000
+    });
+
+    const quotes =
+      data.finance?.result?.[0]?.quotes || [];
+
+    return quotes
+      .map(q => ({
+        type: "stock",
+        symbol: q.symbol,
+        price: q.regularMarketPrice || 0,
+        changePct: q.regularMarketChangePercent || 0,
+        volume: q.regularMarketVolume || 0
+      }))
+      .filter(x =>
+        x.price > 1 &&
+        x.changePct >= MIN_STOCK_GAIN &&
+        x.volume >= MIN_STOCK_VOLUME
+      )
+      .sort((a, b) => b.changePct - a.changePct)
+      .slice(0, 35);
+
+  } catch (err) {
+    console.log("Yahoo discovery error:", err.message);
     return [];
   }
+}
 
   const url = `https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey=${POLYGON_API_KEY}`;
 
