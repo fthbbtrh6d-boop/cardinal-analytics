@@ -48,6 +48,7 @@ const COINBASE_WATCHLIST = (process.env.COINBASE_WATCHLIST || DEFAULT_COINBASE_W
 
 const state = new Map();
 const alertMemory = new Map();
+const stockNewsCache = new Map();
 
 async function sendTelegram(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -104,6 +105,23 @@ function markAlerted(key, score) {
   alertMemory.set(key, { time: Date.now(), score });
 }
 
+function recordAlertReplay(key, asset, analysis) {
+  const entry = state.get(key) || {};
+  const price = asset.price || analysis.price || 0;
+  const replay = entry.replay || {};
+
+  replay.alertedAt = new Date().toISOString();
+  replay.alertPrice = price;
+  replay.maxPriceAfterAlert = price;
+  replay.minPriceAfterAlert = price;
+  replay.outcome = null;
+  replay.followThrough = null;
+  replay.logged = false;
+
+  entry.replay = replay;
+  state.set(key, entry);
+}
+
 function tier(finalScore, ignitionScore) {
   if (finalScore >= PARABOLIC_SCORE) return "🔴 PARABOLIC RISK";
   if (finalScore >= MOMENTUM_SCORE) return "🟢 HIGH CONVICTION";
@@ -115,6 +133,95 @@ function tier(finalScore, ignitionScore) {
 
 function polygonUrl(path) {
   return `https://api.polygon.io${path}${path.includes("?") ? "&" : "?"}apiKey=${encodeURIComponent(POLYGON_API_KEY)}`;
+}
+
+async function getPolygonNews(symbol) {
+  if (!POLYGON_API_KEY || !symbol) return null;
+  const cacheKey = symbol.toUpperCase();
+  if (stockNewsCache.has(cacheKey)) return stockNewsCache.get(cacheKey);
+
+  try {
+    const url = polygonUrl(`/v2/reference/news?ticker=${encodeURIComponent(symbol)}&limit=8`);
+    const { data } = await axios.get(url, { timeout: 20000 });
+    const items = Array.isArray(data.results) ? data.results : [];
+    const news = items.map(item => ({
+      title: item.title,
+      description: item.description,
+      published_utc: item.published_utc,
+      url: item.article_url
+    }));
+    stockNewsCache.set(cacheKey, news);
+    return news;
+  } catch (err) {
+    console.log(`STOCK: Polygon news ${symbol} error:`, err.response?.data || err.message);
+    stockNewsCache.set(cacheKey, null);
+    return null;
+  }
+}
+
+function classifyCatalystHeadlines(news = []) {
+  const positive = [
+    /FDA/i,
+    /earnings/i,
+    /offering closed/i,
+    /offering complete/i,
+    /contract/i,
+    /partnership/i,
+    /analyst upgrade/i,
+    /ETF/i,
+    /regulatory/i,
+    /catalyst/i,
+    /approval/i,
+    /launch/i
+  ];
+  const negative = [
+    /dilution/i,
+    /offering announced/i,
+    /secondary offering/i,
+    /delist/i,
+    /bankruptcy/i,
+    /investigation/i,
+    /lawsuit/i,
+    /suspension/i,
+    /recall/i
+  ];
+
+  let catalystScore = 0;
+  let matched = false;
+  const found = [];
+
+  for (const item of news) {
+    const text = `${item.title || ""} ${item.description || ""}`;
+    for (const regex of negative) {
+      if (regex.test(text)) {
+        matched = true;
+        catalystScore -= 16;
+        found.push(`negative catalyst: ${item.title}`);
+        break;
+      }
+    }
+    if (matched) continue;
+    for (const regex of positive) {
+      if (regex.test(text)) {
+        matched = true;
+        catalystScore += 12;
+        found.push(`positive catalyst: ${item.title}`);
+        break;
+      }
+    }
+  }
+
+  let catalystStatus = "no catalyst found";
+  if (found.length) {
+    if (catalystScore > 0) catalystStatus = "positive catalyst";
+    else catalystStatus = "negative catalyst";
+  }
+
+  return {
+    catalystScore,
+    catalystStatus,
+    catalystReasons: found
+  };
 }
 
 async function getPolygonSnapshot(category) {
@@ -362,6 +469,36 @@ function buildExecution(asset, analysis) {
 
 function updateStateEntry(key, asset, analysis, execution) {
   const prev = state.get(key) || {};
+  const replay = prev.replay ? { ...prev.replay } : null;
+
+  if (replay?.alertedAt) {
+    const price = asset.price || analysis.price || 0;
+    replay.maxPriceAfterAlert = Math.max(replay.maxPriceAfterAlert || price, price);
+    replay.minPriceAfterAlert = Math.min(replay.minPriceAfterAlert || price, price);
+
+    if (!replay.outcome) {
+      const alertPrice = replay.alertPrice || price;
+      if (replay.maxPriceAfterAlert >= alertPrice * 1.06) {
+        replay.outcome = "follow-through";
+        replay.followThrough = true;
+      } else if (replay.minPriceAfterAlert <= alertPrice * 0.96 && price < alertPrice * 0.99) {
+        replay.outcome = "failed";
+        replay.followThrough = false;
+      }
+    }
+
+    if (replay.outcome && !replay.logged) {
+      const alertPrice = replay.alertPrice || asset.price || 0;
+      const maxP = replay.maxPriceAfterAlert || alertPrice;
+      const minP = replay.minPriceAfterAlert || alertPrice;
+      const performance = replay.outcome === "follow-through"
+        ? `+${((maxP / alertPrice - 1) * 100).toFixed(1)}%`
+        : `-${((alertPrice / minP - 1) * 100).toFixed(1)}%`;
+      console.log(`REPLAY: ${asset.display} ${replay.outcome === "follow-through" ? "follow-through" : "failed after alert"} ${performance}`);
+      replay.logged = true;
+    }
+  }
+
   state.set(key, {
     asset,
     analysis,
@@ -382,13 +519,15 @@ function updateStateEntry(key, asset, analysis, execution) {
     higherLow: analysis.higherLow,
     volumeReturning: analysis.volumeReturning,
     pressureBuilding: analysis.pressureBuilding,
-    reclaimHigh: analysis.reclaimHigh
+    reclaimHigh: analysis.reclaimHigh,
+    replay
   });
 }
 
 function shouldSendAlert(asset, analysis, execution, key) {
   if (!analysis) return { send: false, block: "Alert BLOCKED: no analysis" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
+  if (analysis.failedBreakoutRisk === "High") return { send: false, block: "Alert BLOCKED: failed breakout risk" };
   if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "Alert BLOCKED: high risk" };
   if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "Alert BLOCKED: cooldown active" };
 
@@ -543,11 +682,71 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   const noRejection = last.close > last.open && last.close > (last.high + last.low) / 2;
   const retestHeld = prev && prev.close >= breakout * 0.985 && last.close >= breakout * 0.995;
 
+  const floatShares = asset.floatShares || asset.sharesOutstanding || null;
+  let floatScore = 0;
+  let floatRisk = "Unknown";
+  let floatStatus = "float unknown";
+
+  if (Number.isFinite(floatShares) && floatShares > 0) {
+    floatStatus = `${fmtVol(floatShares)} float`;
+    if (floatShares < 5_000_000) {
+      floatScore = 14;
+      floatRisk = "Low";
+    } else if (floatShares < 20_000_000) {
+      floatScore = 10;
+      floatRisk = "Low";
+    } else if (floatShares < 50_000_000) {
+      floatScore = 6;
+      floatRisk = "Medium";
+    } else {
+      floatScore = 2;
+      floatRisk = "Higher";
+    }
+  }
+
+  const catalystData = asset.market === "STOCK" ? classifyCatalystHeadlines(asset.news || []) : { catalystScore: 0, catalystStatus: "no catalyst found", catalystReasons: [] };
+  const catalystScore = catalystData.catalystScore || 0;
+  const catalystStatus = catalystData.catalystStatus;
+  const catalystReasons = catalystData.catalystReasons;
+
+  const previousVolume = previous?.asset?.volume || 0;
+  const volumeChangePct = previousVolume > 0 ? pct(asset.volume, previousVolume) : 0;
+  let premarketAccelerationScore = 0;
+  const premarketStrength = asset.premarket || asset.afterHours;
+  const premarketNotes = [];
+  if (volumeChangePct >= 100) {
+    premarketAccelerationScore += 16;
+    premarketNotes.push("volume doubled across scans");
+  } else if (volumeChangePct >= 50) {
+    premarketAccelerationScore += 12;
+    premarketNotes.push("volume rising sharply across scans");
+  } else if (volumeChangePct >= 20) {
+    premarketAccelerationScore += 8;
+    premarketNotes.push("volume accelerating across scans");
+  }
+  if (premarketStrength) {
+    premarketAccelerationScore += 8;
+    premarketNotes.push("pre/after-hours strength");
+  }
+  if (volumeChangePct > 12 && price >= (previous?.asset?.price || price) * 0.995) {
+    premarketAccelerationScore += 6;
+    premarketNotes.push("price holding highs while volume rises");
+  }
+
   const trend5m = trendCheck(candles5m);
   const trend1m = trendCheck(candles1m);
   const trend15m = trendCheck(candles15m);
   const positiveTrend = trend5m.aligned || trend1m.short || trend15m.medium || trend15m.long;
   const multiTimeframe = trend5m.aligned && (!candles1m || trend1m.short) && (!candles15m || trend15m.medium || trend15m.long);
+  let mtfScore = 0;
+  if (trend1m.short) mtfScore += 12;
+  if (trend5m.aligned) mtfScore += 10;
+  if (trend15m.medium || trend15m.long) mtfScore += 8;
+  let mtfStatus = "MTF unavailable";
+  if (trend1m.short || trend5m.aligned || trend15m.medium || trend15m.long) {
+    mtfStatus = trend5m.aligned && trend1m.short && (trend15m.medium || trend15m.long) ? "Confirmed" : "Partial";
+  }
+  if (!candles15m) mtfStatus = `${mtfStatus} (15m unavailable)`;
 
   const lowFloat = asset.market === "STOCK" && asset.floatShares && asset.floatShares < 20_000_000;
   const smallCapRunner = asset.market === "STOCK" && price >= 0.5 && price <= 25 && (lowFloat || (asset.marketCap && asset.marketCap < 250_000_000));
@@ -555,6 +754,14 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   const extended = asset.changePct > 28 || price > breakout * 1.04;
   const wickRisk = (last.high - last.close) > (last.high - last.low) * 0.42;
   const exhaustionRisk = extended || wickRisk || rangePct > 12;
+  const rejectionCount = recent.slice(-6).filter(c => breakout && c.high >= breakout * 0.995 && c.close < breakout * 0.98).length;
+  const upperWickPct = last.high > last.low ? (last.high - Math.max(last.close, last.open)) / (last.high - last.low) : 0;
+  let failedBreakoutRiskScore = 0;
+  if (breakout > 0 && last.close < breakout * 0.99) failedBreakoutRiskScore += 14;
+  if (upperWickPct > 0.42) failedBreakoutRiskScore += 10;
+  if (rejectionCount >= 2) failedBreakoutRiskScore += 8;
+  if (last.volume > avgVolume * 1.8 && !breakoutCandle && last.close < breakout * 0.995) failedBreakoutRiskScore += 10;
+  const failedBreakoutRisk = failedBreakoutRiskScore >= 18 ? "High" : failedBreakoutRiskScore >= 10 ? "Medium" : "Low";
 
   const supportHold = pullbackHeld || retestHeld;
   const consolidationAfterSpike = recent.slice(0, 6).some(c => c.volume > avg(vols) * 2.2 && c.close > c.open) && tightRange;
@@ -569,6 +776,7 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   let ignitionScore = 0;
   let riskScore = 0;
   const reasons = [...vq.reasons];
+  if (premarketNotes?.length) reasons.push(...premarketNotes);
 
   if (price >= 0.5 && price <= 25) { discoveryScore += 6; reasons.push("ideal runner price range"); }
   if (asset.changePct >= 3) { discoveryScore += 8; reasons.push("power move detected"); }
@@ -577,6 +785,10 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   if (lowFloat) { discoveryScore += 10; reasons.push("low float runner profile"); }
   if (smallCapRunner) { discoveryScore += 8; reasons.push("small cap momentum candidate"); }
   if (earlyRunner) { discoveryScore += 8; reasons.push("pre/after-hours strength"); }
+  if (floatScore && asset.market === "STOCK") { discoveryScore += floatScore; }
+  if (catalystScore > 0) { discoveryScore += Math.min(catalystScore, 12); reasons.push("positive catalyst detected"); }
+  if (catalystScore < 0) { riskScore += Math.min(Math.abs(catalystScore), 20); }
+  if (failedBreakoutRisk === "High") { riskScore += 18; reasons.push("failed breakout risk detected"); }
 
   if (supportHold) { structureScore += 16; reasons.push("support is holding"); }
   if (higherLow) { structureScore += 16; reasons.push("higher lows are forming"); }
@@ -586,6 +798,7 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   if (breakout > 0 && price < breakout) { structureScore += 6; }
   if (consolidationAfterSpike) { structureScore += 10; reasons.push("consolidation after first spike"); }
   if (multiTimeframe) { structureScore += 10; reasons.push("multi-timeframe trend alignment"); }
+  if (mtfScore) { structureScore += Math.min(mtfScore, 12); }
 
   if (vq.quality === "GOOD") { volumeScore += 16; reasons.push("volume is strong and clean"); }
   if (vq.quality === "OK") { volumeScore += 10; reasons.push("volume is acceptable"); }
@@ -593,6 +806,7 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   if (volumeReturning) { volumeScore += 14; reasons.push("volume is beginning to return"); }
   if (volumeExpansion) { volumeScore += 12; reasons.push("sudden volume expansion"); }
   if (pressureBuilding) { volumeScore += 8; reasons.push("breakout pressure is increasing"); }
+  if (premarketAccelerationScore) { volumeScore += Math.min(premarketAccelerationScore, 12); }
 
   if (pressureBuilding) { ignitionScore += 18; reasons.push("pressure building into move"); }
   if (breakoutCandle) { ignitionScore += 20; reasons.push("early breakout candle seen"); }
@@ -632,6 +846,21 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   else if (isIgnition) setup = "Ignition Setup";
   else if (isConsolidation) setup = "Pre-Breakout Setup";
 
+  let replayStatus = "none";
+  if (previous?.replay?.alertedAt) {
+    const replay = previous.replay;
+    const alertPrice = replay.alertPrice || price;
+    const maxP = replay.maxPriceAfterAlert || alertPrice;
+    const minP = replay.minPriceAfterAlert || alertPrice;
+    if (replay.outcome === "follow-through") {
+      replayStatus = `follow-through +${((maxP / alertPrice - 1) * 100).toFixed(1)}%`;
+    } else if (replay.outcome === "failed") {
+      replayStatus = `failed -${((alertPrice / minP - 1) * 100).toFixed(1)}%`;
+    } else {
+      replayStatus = `tracking +${((maxP / alertPrice - 1) * 100).toFixed(1)}% / -${((alertPrice / minP - 1) * 100).toFixed(1)}%`;
+    }
+  }
+
   return {
     score: finalScore,
     finalScore,
@@ -640,6 +869,18 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     volumeScore,
     ignitionScore,
     riskScore,
+    floatScore,
+    floatRisk,
+    floatStatus,
+    catalystScore,
+    catalystStatus,
+    catalystReasons,
+    premarketAccelerationScore,
+    mtfScore,
+    mtfStatus,
+    failedBreakoutRiskScore,
+    failedBreakoutRisk,
+    replayStatus,
     setup,
     move: asset.changePct,
     relVol: vq.relVol,
@@ -684,6 +925,7 @@ async function scanStocks() {
       const c15 = await getYahooCandles(asset.symbol, "15m");
       const key = `STOCK:${asset.symbol}`;
       const previous = state.get(key);
+      asset.news = await getPolygonNews(asset.symbol);
 
       const analysis = analyzeCandleMarket(asset, c5, c1, c15, previous);
       const execution = buildExecution(asset, analysis);
@@ -999,6 +1241,7 @@ async function maybeAlert(asset, analysis, execution, key) {
   }
 
   markAlerted(key, analysis.finalScore);
+  recordAlertReplay(key, asset, analysis);
 
   const decimals = decimalsFor(asset);
 
@@ -1015,9 +1258,17 @@ Price: ${fmtMoney(asset.price, decimals)}
 Move: ${Number(analysis.move || 0).toFixed(2)}%
 Volume: ${fmtVol(analysis.volume)}
 RVOL: ${analysis.relVol?.toFixed?.(2) || "N/A"}
+Float: ${analysis.floatStatus}
+Catalyst: ${analysis.catalystStatus}
+Premarket Acceleration: ${analysis.premarketAccelerationScore || 0}/40
+Failed Breakout Risk: ${analysis.failedBreakoutRisk}
+MTF Confirmation: ${analysis.mtfStatus}
+Replay Status: ${analysis.replayStatus}
 Support: ${analysis.support ? fmtMoney(analysis.support, decimals) : "N/A"}
 Breakout Level: ${analysis.breakout ? fmtMoney(analysis.breakout, decimals) : "N/A"}
+Best Entry: ${execution.formatted.idealEntry}
 Stop/Fails Level: ${execution.formatted.stop}
+Profit Zones: ${analysis.breakout ? `${fmtMoney(analysis.breakout * 1.02, decimals)} / ${fmtMoney(analysis.breakout * 1.04, decimals)} / ${fmtMoney(analysis.breakout * 1.08, decimals)}` : "N/A"}
 Risk: ${analysis.risk}
 Why It Triggered:
 - Tier threshold met
