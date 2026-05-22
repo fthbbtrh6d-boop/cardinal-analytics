@@ -20,10 +20,11 @@ const ALERT_COOLDOWN_MINUTES = Number(process.env.ALERT_COOLDOWN_MINUTES || 120)
 
 const WATCHLIST_SCORE = Number(process.env.WATCHLIST_SCORE || 60);
 const DISCOVERY_SCORE = Number(process.env.DISCOVERY_SCORE || 70);
+const PRE_IGNITION_SCORE = Number(process.env.PRE_IGNITION_SCORE || 70);
 const MOMENTUM_SCORE = Number(process.env.MOMENTUM_SCORE || 90);
 const PARABOLIC_SCORE = Number(process.env.PARABOLIC_SCORE || 97);
-const IGNITION_SCORE = Number(process.env.IGNITION_SCORE || 75);
-const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 85);
+const IGNITION_SCORE = Number(process.env.IGNITION_SCORE || 78);
+const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 80);
 const ALLOW_LOW_RVOL_BREAKOUTS = String(process.env.ALLOW_LOW_RVOL_BREAKOUTS || "true").toLowerCase() === "true";
 
 const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 4);
@@ -126,6 +127,7 @@ function tier(finalScore, ignitionScore) {
   if (finalScore >= PARABOLIC_SCORE) return "🔴 PARABOLIC RISK";
   if (finalScore >= MOMENTUM_SCORE) return "🟢 HIGH CONVICTION";
   if (finalScore >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE) return "🚨 IGNITION";
+  if (finalScore >= PRE_IGNITION_SCORE) return "🟣 PRE-IGNITION";
   if (finalScore >= DISCOVERY_SCORE) return "🟠 DISCOVERY";
   if (finalScore >= WATCHLIST_SCORE) return "🟡 WATCHLIST";
   return "⚪️ HOLD";
@@ -525,11 +527,12 @@ function updateStateEntry(key, asset, analysis, execution) {
 }
 
 function shouldSendAlert(asset, analysis, execution, key) {
-  if (!analysis) return { send: false, block: "Alert BLOCKED: no analysis" };
+  if (!analysis) return { send: false, block: "score too low" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
-  if (analysis.failedBreakoutRisk === "High") return { send: false, block: "Alert BLOCKED: failed breakout risk" };
-  if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "Alert BLOCKED: high risk" };
-  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "Alert BLOCKED: cooldown active" };
+  if (analysis.failedBreakoutRisk === "High") return { send: false, block: "RVOL weak but no structure override" };
+  if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "high risk" };
+  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
+  if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "RVOL weak but no structure override" };
 
   const score = analysis.finalScore;
   const ignitionScore = analysis.ignitionScore || 0;
@@ -537,8 +540,10 @@ function shouldSendAlert(asset, analysis, execution, key) {
   if (score >= PARABOLIC_SCORE && execution.executionScore >= 65) return { send: true };
   if (score >= MOMENTUM_SCORE && execution.executionScore >= 68) return { send: true };
   if (score >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE && execution.executionScore >= 62) return { send: true };
+  if (score >= PRE_IGNITION_SCORE && analysis.structureStrong && execution.executionScore >= 58) return { send: true };
+  if (score >= PRE_IGNITION_SCORE) return { send: false, block: "structure weak" };
 
-  return { send: false, block: "Alert BLOCKED: non-ignition/discovery watch only" };
+  return { send: false, block: "score too low" };
 }
 
 async function getYahooStockDiscovery() {
@@ -769,6 +774,7 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   const reclaimHigh = price >= priorHigh || (previous && previous.recentHigh && price >= previous.recentHigh);
   const isIgnition = pressureBuilding && (nearBreakout || breakoutCandle || reclaimHigh);
   const isBreakout = breakoutCandle && noRejection && volumeReturning;
+  const structureStrong = tightRange && higherLow && supportHold && pressureBuilding && volumeReturning;
 
   let discoveryScore = 0;
   let structureScore = 0;
@@ -777,6 +783,8 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   let riskScore = 0;
   const reasons = [...vq.reasons];
   if (premarketNotes?.length) reasons.push(...premarketNotes);
+
+  const structureClean = supportHold && higherLow && tightRange;
 
   if (price >= 0.5 && price <= 25) { discoveryScore += 6; reasons.push("ideal runner price range"); }
   if (asset.changePct >= 3) { discoveryScore += 8; reasons.push("power move detected"); }
@@ -790,32 +798,43 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   if (catalystScore < 0) { riskScore += Math.min(Math.abs(catalystScore), 20); }
   if (failedBreakoutRisk === "High") { riskScore += 18; reasons.push("failed breakout risk detected"); }
 
-  if (supportHold) { structureScore += 16; reasons.push("support is holding"); }
-  if (higherLow) { structureScore += 16; reasons.push("higher lows are forming"); }
-  if (tightRange) { structureScore += 14; reasons.push("tight compression under resistance"); }
+  if (supportHold) { structureScore += 20; reasons.push("support is holding"); }
+  if (higherLow) { structureScore += 20; reasons.push("higher lows are forming"); }
+  if (tightRange) { structureScore += 18; reasons.push("tight compression under resistance"); }
   if (nearBreakout) { structureScore += 12; reasons.push("price is near resistance"); }
-  if (reclaimHigh) { structureScore += 10; reasons.push("reclaiming prior highs"); }
+  if (reclaimHigh) { structureScore += 14; reasons.push("reclaiming prior highs"); }
   if (breakout > 0 && price < breakout) { structureScore += 6; }
   if (consolidationAfterSpike) { structureScore += 10; reasons.push("consolidation after first spike"); }
   if (multiTimeframe) { structureScore += 10; reasons.push("multi-timeframe trend alignment"); }
   if (mtfScore) { structureScore += Math.min(mtfScore, 12); }
+  if (pressureBuilding && !breakoutCandle) { structureScore += 6; }
 
   if (vq.quality === "GOOD") { volumeScore += 16; reasons.push("volume is strong and clean"); }
   if (vq.quality === "OK") { volumeScore += 10; reasons.push("volume is acceptable"); }
-  if (vq.quality === "LOW") { volumeScore += 6; reasons.push("low RVOL breakout allowed"); }
-  if (volumeReturning) { volumeScore += 14; reasons.push("volume is beginning to return"); }
+  if (vq.quality === "LOW") {
+    volumeScore += 6;
+    if (structureClean) {
+      volumeScore += 8;
+      reasons.push("clean structure supports low RVOL");
+    } else {
+      riskScore += 6;
+      reasons.push("low RVOL without clean structure");
+    }
+  }
+  if (volumeReturning) { volumeScore += 16; reasons.push("volume is beginning to return"); }
   if (volumeExpansion) { volumeScore += 12; reasons.push("sudden volume expansion"); }
-  if (pressureBuilding) { volumeScore += 8; reasons.push("breakout pressure is increasing"); }
+  if (pressureBuilding) { volumeScore += 12; reasons.push("breakout pressure is increasing"); }
   if (premarketAccelerationScore) { volumeScore += Math.min(premarketAccelerationScore, 12); }
 
-  if (pressureBuilding) { ignitionScore += 18; reasons.push("pressure building into move"); }
-  if (breakoutCandle) { ignitionScore += 20; reasons.push("early breakout candle seen"); }
-  if (volumeReturning) { ignitionScore += 16; reasons.push("volume is returning on rise"); }
-  if (retestHeld) { ignitionScore += 10; reasons.push("retest holding support"); }
-  if (reclaimHigh) { ignitionScore += 12; reasons.push("reclaiming highs for continuation"); }
-  if (consolidationAfterSpike) { ignitionScore += 10; reasons.push("consolidation after first spike"); }
-  if (isIgnition) { ignitionScore += 14; }
-  if (isBreakout) { ignitionScore += 18; reasons.push("breakout continuation"); }
+  if (pressureBuilding) { ignitionScore += 20; reasons.push("pressure building into move"); }
+  if (breakoutCandle) { ignitionScore += 24; reasons.push("early breakout candle seen"); }
+  if (volumeReturning) { ignitionScore += 18; reasons.push("volume is returning on rise"); }
+  if (retestHeld) { ignitionScore += 12; reasons.push("retest holding support"); }
+  if (reclaimHigh) { ignitionScore += 14; reasons.push("reclaiming highs for continuation"); }
+  if (consolidationAfterSpike) { ignitionScore += 12; reasons.push("consolidation after first spike"); }
+  if (structureClean) { ignitionScore += 6; reasons.push("clean structure supports ignition"); }
+  if (isIgnition) { ignitionScore += 18; }
+  if (isBreakout) { ignitionScore += 20; reasons.push("breakout continuation"); }
 
   if (previous && previous.analysis?.finalScore) {
     const deltaScore = (discoveryScore + structureScore + volumeScore + ignitionScore - riskScore) - previous.analysis.finalScore;
@@ -826,10 +845,10 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     if (pressureBuilding && previous.pressureBuilding) { ignitionScore += 8; reasons.push("pressure is building across scans"); }
   }
 
-  if (exhaustionRisk) { riskScore += 24; reasons.push("extended/rejection risk present"); }
-  if (!supportHold) { riskScore += 16; reasons.push("support not holding"); }
-  if (vq.quality === "BAD") { riskScore += 30; reasons.push("volume quality is poor"); }
-  if (asset.market === "DEX" && asset.liquidity < MIN_DEX_LIQUIDITY * 1.2) { riskScore += 12; reasons.push("DEX liquidity is thin"); }
+  if (exhaustionRisk) { riskScore += 28; reasons.push("extended/rejection risk present"); }
+  if (!supportHold) { riskScore += 20; reasons.push("support not holding"); }
+  if (vq.quality === "BAD") { riskScore += 32; reasons.push("volume quality is poor"); }
+  if (asset.market === "DEX" && asset.liquidity < MIN_DEX_LIQUIDITY * 1.2) { riskScore += 14; reasons.push("DEX liquidity is thin"); }
 
   if (!asset.price || asset.price < 0.5) { riskScore += 12; reasons.push("price is too low for reliable pattern detection"); }
 
@@ -866,6 +885,7 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     finalScore,
     discoveryScore,
     structureScore,
+    structureStrong,
     volumeScore,
     ignitionScore,
     riskScore,
@@ -1218,7 +1238,7 @@ async function scanMomentumIgnition() {
     const { asset, analysis, execution } = entry;
     if (!analysis || !execution) continue;
 
-    const ignitionCandidate = analysis.finalScore >= IGNITION_ALERT_SCORE && analysis.ignitionScore >= IGNITION_SCORE;
+    const ignitionCandidate = (analysis.finalScore >= IGNITION_ALERT_SCORE && analysis.ignitionScore >= IGNITION_SCORE) || (analysis.finalScore >= PRE_IGNITION_SCORE && analysis.structureStrong);
     if (!ignitionCandidate) continue;
     if (!cooldownPassed(key, analysis.finalScore)) {
       console.log(`${asset.market}: ${asset.display} | ALERT BLOCKED: cooldown active`);
@@ -1234,16 +1254,21 @@ async function scanMomentumIgnition() {
 
 async function maybeAlert(asset, analysis, execution, key) {
   const decision = shouldSendAlert(asset, analysis, execution, key);
+  const decimals = decimalsFor(asset);
+  const profitZones = analysis.breakout ? `${fmtMoney(analysis.breakout * 1.02, decimals)} / ${fmtMoney(analysis.breakout * 1.04, decimals)} / ${fmtMoney(analysis.breakout * 1.08, decimals)}` : "N/A";
+  const bestEntry = execution.formatted.idealEntry || "N/A";
+  const failLevel = execution.formatted.stop || "N/A";
+  const summary = `${asset.market}: ${asset.display} | ${analysis.setup} | Final ${analysis.finalScore} | Exec ${execution.executionScore} | Best Entry ${bestEntry} | Fail Level ${failLevel} | Profit Zones ${profitZones}`;
 
+  const tierLabel = tier(analysis.finalScore, analysis.ignitionScore);
   if (!decision.send) {
-    console.log(`${asset.market}: ${asset.display} | ${decision.block}`);
+    console.log(`${tierLabel}: ALERT BLOCKED: ${summary} | ${decision.block}`);
     return;
   }
 
+  console.log(`${tierLabel}: ALERT SENT: ${summary}`);
   markAlerted(key, analysis.finalScore);
   recordAlertReplay(key, asset, analysis);
-
-  const decimals = decimalsFor(asset);
 
   await sendTelegram(
 `🚨 CARDINAL EXECUTION ENGINE
@@ -1266,9 +1291,9 @@ MTF Confirmation: ${analysis.mtfStatus}
 Replay Status: ${analysis.replayStatus}
 Support: ${analysis.support ? fmtMoney(analysis.support, decimals) : "N/A"}
 Breakout Level: ${analysis.breakout ? fmtMoney(analysis.breakout, decimals) : "N/A"}
-Best Entry: ${execution.formatted.idealEntry}
-Stop/Fails Level: ${execution.formatted.stop}
-Profit Zones: ${analysis.breakout ? `${fmtMoney(analysis.breakout * 1.02, decimals)} / ${fmtMoney(analysis.breakout * 1.04, decimals)} / ${fmtMoney(analysis.breakout * 1.08, decimals)}` : "N/A"}
+Best Entry: ${bestEntry}
+Stop/Fails Level: ${failLevel}
+Profit Zones: ${profitZones}
 Risk: ${analysis.risk}
 Why It Triggered:
 - Tier threshold met
