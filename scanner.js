@@ -301,6 +301,49 @@ function scoreCap(score, setup, risk, volumeQuality) {
   return Math.min(score, 94);
 }
 
+function calculateFinalScore({
+  ignitionScore = 0,
+  structureScore = 0,
+  continuationScore = 0,
+  catalystFound = false,
+  rvol = 0,
+  move = 0,
+  premarketAcceleration = 0,
+  mtfConfirmed = false,
+  replayStatus = "none",
+}) {
+  let finalScore =
+    ignitionScore * 0.55 +
+    structureScore * 0.25 +
+    continuationScore * 0.20;
+
+  if (ignitionScore < 65) finalScore -= 15;
+  if (premarketAcceleration < 15) finalScore -= 12;
+  if (rvol < 3) finalScore -= 10;
+  if (!catalystFound) finalScore -= 8;
+  if (!mtfConfirmed) finalScore -= 5;
+  if (move < 0) finalScore -= 12;
+
+  if (rvol >= 5) finalScore += 8;
+  if (rvol >= 8) finalScore += 12;
+  if (premarketAcceleration >= 25) finalScore += 10;
+  if (catalystFound) finalScore += 8;
+  if (replayStatus === "confirmed") finalScore += 8;
+
+  finalScore = Math.max(0, Math.min(100, Math.round(finalScore)));
+
+  let tier = "IGNORE";
+  if (finalScore >= 90 && ignitionScore >= 75 && rvol >= 5 && move > 0) {
+    tier = "🟢 HIGH CONVICTION";
+  } else if (finalScore >= 82 && ignitionScore >= 65 && move > 0) {
+    tier = "🟡 IGNITION WATCH";
+  } else if (finalScore >= 72) {
+    tier = "🟠 EARLY WATCH";
+  }
+
+  return { finalScore, tier };
+}
+
 function volumeQualityCheck(asset, vols, priorVols, latestVolume) {
   const recentAvg = avg(vols.slice(0, -1));
   const priorAvg = avg(priorVols);
@@ -536,12 +579,27 @@ function shouldSendAlert(asset, analysis, execution, key) {
 
   const score = analysis.finalScore;
   const ignitionScore = analysis.ignitionScore || 0;
+  const tierLabel = analysis.tierLabel || "";
 
+  // High Conviction tier
+  if (tierLabel.includes("HIGH CONVICTION") && score >= 90 && ignitionScore >= 75 && execution.executionScore >= 68) {
+    return { send: true };
+  }
+
+  // Ignition Watch tier
+  if (tierLabel.includes("IGNITION WATCH") && score >= 82 && ignitionScore >= 65 && execution.executionScore >= 62) {
+    return { send: true };
+  }
+
+  // Early Watch tier (watch only, no Telegram)
+  if (tierLabel.includes("EARLY WATCH") && score >= 72 && execution.executionScore >= 55) {
+    return { send: false, block: "EARLY WATCH - watch only, no Telegram" };
+  }
+
+  // Legacy tier handling
   if (score >= PARABOLIC_SCORE && execution.executionScore >= 65) return { send: true };
   if (score >= MOMENTUM_SCORE && execution.executionScore >= 68) return { send: true };
   if (score >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE && execution.executionScore >= 62) return { send: true };
-  if (score >= PRE_IGNITION_SCORE && analysis.structureStrong && execution.executionScore >= 58) return { send: true };
-  if (score >= PRE_IGNITION_SCORE) return { send: false, block: "structure weak" };
 
   return { send: false, block: "score too low" };
 }
@@ -852,9 +910,21 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
 
   if (!asset.price || asset.price < 0.5) { riskScore += 12; reasons.push("price is too low for reliable pattern detection"); }
 
-  const rawScore = discoveryScore + structureScore + volumeScore + ignitionScore - riskScore;
-  let finalScore = scoreCap(rawScore, isBreakout ? "Breakout Execution" : isIgnition ? "Ignition Execution" : isConsolidation ? "Pre-Breakout Execution" : "Discovery", riskScore > 20 ? "High" : "Medium", vq.quality);
-  finalScore = Math.max(0, Math.min(100, finalScore));
+  const mtfConfirmed = mtfStatus === "Confirmed";
+  const catalystFound = catalystScore > 0 || (catalystStatus !== "no catalyst found");
+  const { finalScore: newFinalScore, tier: newTier } = calculateFinalScore({
+    ignitionScore,
+    structureScore,
+    continuationScore: volumeScore,
+    catalystFound,
+    rvol: vq.relVol || 0,
+    move: asset.changePct || 0,
+    premarketAcceleration: premarketAccelerationScore || 0,
+    mtfConfirmed,
+    replayStatus: "none",
+  });
+
+  let finalScore = newFinalScore;
 
   let risk = "Medium";
   if (riskScore >= 30 || exhaustionRisk || vq.quality === "BAD") risk = "High";
@@ -880,9 +950,12 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     }
   }
 
+  const tierLabel = newTier || tier(finalScore, ignitionScore);
+
   return {
     score: finalScore,
     finalScore,
+    tierLabel,
     discoveryScore,
     structureScore,
     structureStrong,
@@ -1260,7 +1333,7 @@ async function maybeAlert(asset, analysis, execution, key) {
   const failLevel = execution.formatted.stop || "N/A";
   const summary = `${asset.market}: ${asset.display} | ${analysis.setup} | Final ${analysis.finalScore} | Exec ${execution.executionScore} | Best Entry ${bestEntry} | Fail Level ${failLevel} | Profit Zones ${profitZones}`;
 
-  const tierLabel = tier(analysis.finalScore, analysis.ignitionScore);
+  const tierLabel = analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore);
   if (!decision.send) {
     console.log(`${tierLabel}: ALERT BLOCKED: ${summary} | ${decision.block}`);
     return;
@@ -1275,7 +1348,7 @@ async function maybeAlert(asset, analysis, execution, key) {
 
 Ticker/Pair: ${asset.display}
 Market: ${asset.market}
-Tier: ${tier(analysis.finalScore, analysis.ignitionScore)}
+Tier: ${analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore)}
 Final Score: ${analysis.finalScore}/100
 Ignition Score: ${analysis.ignitionScore}/100
 Setup Type: ${analysis.setup}
