@@ -360,6 +360,32 @@ function buildExecution(asset, analysis) {
   };
 }
 
+function updateStateEntry(key, asset, analysis, execution) {
+  const prev = state.get(key) || {};
+  state.set(key, {
+    asset,
+    analysis,
+    execution,
+    updated: new Date().toISOString(),
+    previousPrice: prev.asset?.price,
+    previousScore: prev.analysis?.finalScore,
+    previousVolume: prev.asset?.volume,
+    previousHigh: prev.recentHigh,
+    previousLow: prev.recentLow,
+    previousTightening: prev.tightRange,
+    previousHigherLows: prev.higherLow,
+    previousVolumeReturning: prev.volumeReturning,
+    previousPressureBuilding: prev.pressureBuilding,
+    recentHigh: analysis.recentHigh,
+    recentLow: analysis.recentLow,
+    tightRange: analysis.tightRange,
+    higherLow: analysis.higherLow,
+    volumeReturning: analysis.volumeReturning,
+    pressureBuilding: analysis.pressureBuilding,
+    reclaimHigh: analysis.reclaimHigh
+  });
+}
+
 function shouldSendAlert(asset, analysis, execution, key) {
   if (!analysis) return { send: false, block: "Alert BLOCKED: no analysis" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
@@ -372,10 +398,8 @@ function shouldSendAlert(asset, analysis, execution, key) {
   if (score >= PARABOLIC_SCORE && execution.executionScore >= 65) return { send: true };
   if (score >= MOMENTUM_SCORE && execution.executionScore >= 68) return { send: true };
   if (score >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE && execution.executionScore >= 62) return { send: true };
-  if (score >= DISCOVERY_SCORE && execution.executionScore >= 58) return { send: true };
-  if (score >= WATCHLIST_SCORE && execution.executionScore >= 55) return { send: true };
 
-  return { send: false, block: "Alert BLOCKED: score below alert threshold" };
+  return { send: false, block: "Alert BLOCKED: non-ignition/discovery watch only" };
 }
 
 async function getYahooStockDiscovery() {
@@ -455,7 +479,7 @@ async function getYahooCandles(symbol, interval = "5m") {
   }
 }
 
-function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m = null) {
+function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m = null, previous = null) {
   if (!candles5m || candles5m.length < 40) {
     return {
       score: 0,
@@ -473,7 +497,14 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
       support: null,
       breakout: null,
       risk: "High",
-      reasons: ["insufficient candle history"]
+      reasons: ["insufficient candle history"],
+      recentHigh: null,
+      recentLow: null,
+      tightRange: false,
+      higherLow: false,
+      volumeReturning: false,
+      pressureBuilding: false,
+      reclaimHigh: false
     };
   }
 
@@ -505,8 +536,10 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   const pullbackHeld = price > support * 1.025;
   const nearBreakout = distanceToBreakoutPct >= 0 && distanceToBreakoutPct <= 2.5;
   const breakoutCandle = price > breakout * 1.002;
-  const volumeReturning = last.volume > avg(vols.slice(0, -1)) * 1.4;
-  const pressureBuilding = vq.relVol >= 1.15 || last.volume > avg(vols.slice(0, -1)) * 1.2;
+  const avgVolume = avg(vols.slice(0, -1));
+  const volumeReturning = avgVolume > 0 && last.volume >= avgVolume * 1.4;
+  const volumeExpansion = avgVolume > 0 && last.volume >= avgVolume * 2;
+  const pressureBuilding = last.close >= recentHigh * 0.995 || vq.relVol >= 1.1 || last.volume > avgVolume * 1.2;
   const noRejection = last.close > last.open && last.close > (last.high + last.low) / 2;
   const retestHeld = prev && prev.close >= breakout * 0.985 && last.close >= breakout * 0.995;
 
@@ -517,13 +550,17 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   const multiTimeframe = trend5m.aligned && (!candles1m || trend1m.short) && (!candles15m || trend15m.medium || trend15m.long);
 
   const lowFloat = asset.market === "STOCK" && asset.floatShares && asset.floatShares < 20_000_000;
+  const smallCapRunner = asset.market === "STOCK" && price >= 0.5 && price <= 25 && (lowFloat || (asset.marketCap && asset.marketCap < 250_000_000));
+  const earlyRunner = asset.market === "STOCK" && (asset.premarket || asset.afterHours);
   const extended = asset.changePct > 28 || price > breakout * 1.04;
   const wickRisk = (last.high - last.close) > (last.high - last.low) * 0.42;
   const exhaustionRisk = extended || wickRisk || rangePct > 12;
 
   const supportHold = pullbackHeld || retestHeld;
+  const consolidationAfterSpike = recent.slice(0, 6).some(c => c.volume > avg(vols) * 2.2 && c.close > c.open) && tightRange;
   const isConsolidation = higherLow && tightRange && supportHold;
-  const isIgnition = pressureBuilding && (nearBreakout || breakoutCandle);
+  const reclaimHigh = price >= priorHigh || (previous && previous.recentHigh && price >= previous.recentHigh);
+  const isIgnition = pressureBuilding && (nearBreakout || breakoutCandle || reclaimHigh);
   const isBreakout = breakoutCandle && noRejection && volumeReturning;
 
   let discoveryScore = 0;
@@ -533,25 +570,47 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
   let riskScore = 0;
   const reasons = [...vq.reasons];
 
+  if (price >= 0.5 && price <= 25) { discoveryScore += 6; reasons.push("ideal runner price range"); }
   if (asset.changePct >= 3) { discoveryScore += 8; reasons.push("power move detected"); }
   if (asset.changePct >= 6) { discoveryScore += 8; reasons.push("momentum is accelerating"); }
   if (positiveTrend) { discoveryScore += 8; reasons.push("trend bias is bullish"); }
-  if (lowFloat) { discoveryScore += 6; reasons.push("low float squeeze potential"); }
-  if (supportHold) { structureScore += 12; reasons.push("support is holding"); }
-  if (higherLow) { structureScore += 14; reasons.push("higher lows are forming"); }
-  if (tightRange) { structureScore += 12; reasons.push("tight consolidation prior to move"); }
-  if (nearBreakout) { structureScore += 10; reasons.push("price is near resistance"); }
-  if (breakout > 0 && price < breakout) { structureScore += 4; }
-  if (vq.quality === "GOOD") { volumeScore += 18; reasons.push("volume is strong and clean"); }
+  if (lowFloat) { discoveryScore += 10; reasons.push("low float runner profile"); }
+  if (smallCapRunner) { discoveryScore += 8; reasons.push("small cap momentum candidate"); }
+  if (earlyRunner) { discoveryScore += 8; reasons.push("pre/after-hours strength"); }
+
+  if (supportHold) { structureScore += 16; reasons.push("support is holding"); }
+  if (higherLow) { structureScore += 16; reasons.push("higher lows are forming"); }
+  if (tightRange) { structureScore += 14; reasons.push("tight compression under resistance"); }
+  if (nearBreakout) { structureScore += 12; reasons.push("price is near resistance"); }
+  if (reclaimHigh) { structureScore += 10; reasons.push("reclaiming prior highs"); }
+  if (breakout > 0 && price < breakout) { structureScore += 6; }
+  if (consolidationAfterSpike) { structureScore += 10; reasons.push("consolidation after first spike"); }
+  if (multiTimeframe) { structureScore += 10; reasons.push("multi-timeframe trend alignment"); }
+
+  if (vq.quality === "GOOD") { volumeScore += 16; reasons.push("volume is strong and clean"); }
   if (vq.quality === "OK") { volumeScore += 10; reasons.push("volume is acceptable"); }
-  if (vq.quality === "LOW") { volumeScore += 6; reasons.push("volume is lower but setup still structured"); }
-  if (vq.relVol >= 1.3) { volumeScore += 10; reasons.push("relative volume is rising"); }
-  if (pressureBuilding) { ignitionScore += 14; reasons.push("pressure building into move"); }
-  if (breakoutCandle) { ignitionScore += 18; reasons.push("early breakout candle seen"); }
-  if (volumeReturning) { ignitionScore += 12; reasons.push("volume is returning on rise"); }
-  if (retestHeld) { ignitionScore += 8; reasons.push("retest holding support"); }
-  if (isIgnition) { ignitionScore += 10; }
-  if (isBreakout) { ignitionScore += 16; }
+  if (vq.quality === "LOW") { volumeScore += 6; reasons.push("low RVOL breakout allowed"); }
+  if (volumeReturning) { volumeScore += 14; reasons.push("volume is beginning to return"); }
+  if (volumeExpansion) { volumeScore += 12; reasons.push("sudden volume expansion"); }
+  if (pressureBuilding) { volumeScore += 8; reasons.push("breakout pressure is increasing"); }
+
+  if (pressureBuilding) { ignitionScore += 18; reasons.push("pressure building into move"); }
+  if (breakoutCandle) { ignitionScore += 20; reasons.push("early breakout candle seen"); }
+  if (volumeReturning) { ignitionScore += 16; reasons.push("volume is returning on rise"); }
+  if (retestHeld) { ignitionScore += 10; reasons.push("retest holding support"); }
+  if (reclaimHigh) { ignitionScore += 12; reasons.push("reclaiming highs for continuation"); }
+  if (consolidationAfterSpike) { ignitionScore += 10; reasons.push("consolidation after first spike"); }
+  if (isIgnition) { ignitionScore += 14; }
+  if (isBreakout) { ignitionScore += 18; reasons.push("breakout continuation"); }
+
+  if (previous && previous.analysis?.finalScore) {
+    const deltaScore = (discoveryScore + structureScore + volumeScore + ignitionScore - riskScore) - previous.analysis.finalScore;
+    if (deltaScore >= 6) { ignitionScore += 10; reasons.push("score improving across scans"); }
+    if (reclaimHigh && previous.recentHigh && price > previous.recentHigh) { ignitionScore += 12; reasons.push("reclaiming prior scan highs"); }
+    if (tightRange && previous.isTightening) { ignitionScore += 8; reasons.push("tightening continues across scans"); }
+    if (volumeReturning && previous.volumeReturning) { ignitionScore += 8; reasons.push("volume return is persistent"); }
+    if (pressureBuilding && previous.pressureBuilding) { ignitionScore += 8; reasons.push("pressure is building across scans"); }
+  }
 
   if (exhaustionRisk) { riskScore += 24; reasons.push("extended/rejection risk present"); }
   if (!supportHold) { riskScore += 16; reasons.push("support not holding"); }
@@ -592,12 +651,21 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     volumeQuality: vq.quality,
     lowRvolOnly: vq.lowRvolOnly,
     reasons,
-    blockReason: null
+    blockReason: null,
+    recentHigh,
+    recentLow,
+    tightRange,
+    higherLow,
+    volumeReturning,
+    pressureBuilding,
+    reclaimHigh,
+    breakoutCandle,
+    priorHigh
   };
 }
 
-function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = null) {
-  return analyzeMomentumIgnition(asset, candles5m, candles1m, candles15m);
+function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = null, previous = null) {
+  return analyzeMomentumIgnition(asset, candles5m, candles1m, candles15m, previous);
 }
 
 async function scanStocks() {
@@ -614,14 +682,15 @@ async function scanStocks() {
       const c5 = await getYahooCandles(asset.symbol, "5m");
       const c1 = await getYahooCandles(asset.symbol, "1m");
       const c15 = await getYahooCandles(asset.symbol, "15m");
-
-      const analysis = analyzeCandleMarket(asset, c5, c1, c15);
-      const execution = buildExecution(asset, analysis);
       const key = `STOCK:${asset.symbol}`;
+      const previous = state.get(key);
 
-      state.set(key, { asset, analysis, execution, updated: new Date().toISOString() });
+      const analysis = analyzeCandleMarket(asset, c5, c1, c15, previous);
+      const execution = buildExecution(asset, analysis);
 
-      console.log(`STOCK: ${asset.symbol} | ${analysis.setup} | Setup ${analysis.score} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | ${execution.tradeState}`);
+      updateStateEntry(key, asset, analysis, execution);
+
+      console.log(`STOCK: ${asset.symbol} | ${analysis.setup} | Final ${analysis.finalScore} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | ${execution.tradeState}`);
 
       await maybeAlert(asset, analysis, execution, key);
       results.push({ asset, analysis, execution });
@@ -685,14 +754,15 @@ async function scanCoinbaseCrypto() {
         volume: volume24h,
         url: `https://www.coinbase.com/advanced-trade/spot/${symbol}`
       };
-
-      const analysis = analyzeCandleMarket(asset, candles, null, null);
-      const execution = buildExecution(asset, analysis);
       const key = `COINBASE:${symbol}`;
+      const previous = state.get(key);
 
-      state.set(key, { asset, analysis, execution, updated: new Date().toISOString() });
+      const analysis = analyzeCandleMarket(asset, candles, null, null, previous);
+      const execution = buildExecution(asset, analysis);
 
-      console.log(`COINBASE: ${symbol} | ${analysis.setup} | Setup ${analysis.score} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | ${execution.tradeState}`);
+      updateStateEntry(key, asset, analysis, execution);
+
+      console.log(`COINBASE: ${symbol} | ${analysis.setup} | Final ${analysis.finalScore} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | ${execution.tradeState}`);
 
       await maybeAlert(asset, analysis, execution, key);
       results.push({ asset, analysis, execution });
@@ -728,7 +798,7 @@ async function getDexScreenerPairs() {
   return [...found.values()];
 }
 
-function analyzeDexPair(pair, asset) {
+function analyzeDexPair(pair, asset, previous = null) {
   const liquidity = pair.liquidity?.usd || 0;
   const vol5m = pair.volume?.m5 || 0;
   const txns5m = (pair.txns?.m5?.buys || 0) + (pair.txns?.m5?.sells || 0);
@@ -738,7 +808,7 @@ function analyzeDexPair(pair, asset) {
   const change1h = pair.priceChange?.h1 || 0;
 
   if (liquidity < MIN_DEX_LIQUIDITY) {
-    return { score: 0, setup: "Liquidity Too Low", blockReason: "Alert BLOCKED: liquidity too low" };
+    return { score: 0, finalScore: 0, setup: "Liquidity Too Low", blockReason: "Alert BLOCKED: liquidity too low", relVol: 0, volume: vol5m, price: asset.price, support: null, breakout: null, risk: "High", volumeQuality: "BAD", reasons: ["liquidity too low"], recentHigh: null, recentLow: null, tightRange: false, higherLow: false, volumeReturning: false, pressureBuilding: false, reclaimHigh: false };
   }
 
   let volumeQuality = "OK";
@@ -762,6 +832,7 @@ function analyzeDexPair(pair, asset) {
   if (change5m >= 6 || change1h >= 12) { score += 12; reasons.push("short-term DEX momentum"); }
   if (buyRatio >= 0.58) { score += 12; reasons.push("buyers leading sellers"); }
   if (pressure >= 0.1) { score += 10; reasons.push("volume/liquidity pressure building"); }
+  if (relVol >= 1.2) { score += 8; reasons.push("DEX RVOL pressure building"); }
 
   let risk = "Medium";
   if (liquidity < 150000) risk = "Medium-High";
@@ -781,6 +852,21 @@ function analyzeDexPair(pair, asset) {
     reasons.push("bad DEX volume quality");
   }
 
+  if (previous && previous.analysis?.finalScore) {
+    if (score > previous.analysis.finalScore) {
+      score += 8;
+      reasons.push("DEX score improving across scans");
+    }
+    if (pressure >= 0.1 && previous.pressureBuilding) {
+      score += 6;
+      reasons.push("DEX pressure building across scans");
+    }
+    if (vol5m > previous.previousVolume * 1.2) {
+      score += 8;
+      reasons.push("DEX volume returning");
+    }
+  }
+
   const setup =
     score >= MOMENTUM_SCORE
       ? "DEX Momentum Execution"
@@ -788,8 +874,11 @@ function analyzeDexPair(pair, asset) {
         ? "DEX Execution Watch"
         : "DEX Discovery Watch";
 
+  const finalScore = scoreCap(Math.max(0, score), setup, risk, volumeQuality);
+
   return {
-    score: scoreCap(Math.max(0, score), setup, risk, volumeQuality),
+    score: finalScore,
+    finalScore,
     setup,
     move: Math.max(change5m, change1h),
     relVol,
@@ -802,7 +891,14 @@ function analyzeDexPair(pair, asset) {
     liquidity,
     vol5m,
     txns5m,
-    reasons
+    reasons,
+    recentHigh: null,
+    recentLow: null,
+    tightRange: false,
+    higherLow: false,
+    volumeReturning: false,
+    pressureBuilding: pressure >= 0.1,
+    reclaimHigh: false
   };
 }
 
@@ -847,14 +943,15 @@ async function scanDexScreener() {
         pairAddress: pair.pairAddress,
         marketCap: pair.marketCap || pair.fdv || null
       };
-
-      const analysis = analyzeDexPair(pair, asset);
-      const execution = buildExecution(asset, analysis);
       const key = `DEX:${pair.chainId}:${pair.pairAddress}`;
+      const previous = state.get(key);
 
-      state.set(key, { asset, analysis, execution, updated: new Date().toISOString() });
+      const analysis = analyzeDexPair(pair, asset, previous);
+      const execution = buildExecution(asset, analysis);
 
-      console.log(`DEX: ${display} | ${analysis.setup} | Setup ${analysis.score} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | Liquidity ${fmtVol(liquidity)} | ${execution.tradeState}`);
+      updateStateEntry(key, asset, analysis, execution);
+
+      console.log(`DEX: ${display} | ${analysis.setup} | Final ${analysis.finalScore} | Exec ${execution.executionScore} | Vol ${analysis.volumeQuality} | Liquidity ${fmtVol(liquidity)} | ${execution.tradeState}`);
 
       await maybeAlert(asset, analysis, execution, key);
       results.push({ asset, analysis, execution });
