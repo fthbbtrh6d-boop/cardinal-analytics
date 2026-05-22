@@ -13,9 +13,18 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ENABLE_STOCKS = String(process.env.ENABLE_STOCKS || "true").toLowerCase() === "true";
 const ENABLE_COINBASE = String(process.env.ENABLE_COINBASE || "true").toLowerCase() === "true";
 const ENABLE_DEXSCREENER = String(process.env.ENABLE_DEXSCREENER || "false").toLowerCase() === "true";
+const ENABLE_IGNITION_SCANNER = String(process.env.ENABLE_IGNITION_SCANNER || "true").toLowerCase() === "true";
 
 const SCAN_INTERVAL_SECONDS = Number(process.env.SCAN_INTERVAL_SECONDS || 60);
 const ALERT_COOLDOWN_MINUTES = Number(process.env.ALERT_COOLDOWN_MINUTES || 120);
+
+const WATCHLIST_SCORE = Number(process.env.WATCHLIST_SCORE || 60);
+const DISCOVERY_SCORE = Number(process.env.DISCOVERY_SCORE || 70);
+const MOMENTUM_SCORE = Number(process.env.MOMENTUM_SCORE || 90);
+const PARABOLIC_SCORE = Number(process.env.PARABOLIC_SCORE || 97);
+const IGNITION_SCORE = Number(process.env.IGNITION_SCORE || 75);
+const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 85);
+const ALLOW_LOW_RVOL_BREAKOUTS = String(process.env.ALLOW_LOW_RVOL_BREAKOUTS || "true").toLowerCase() === "true";
 
 const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 4);
 const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 1000000);
@@ -28,9 +37,7 @@ const MAX_DEX_LIQUIDITY = Number(process.env.MAX_DEX_LIQUIDITY || 5000000);
 const MIN_DEX_VOLUME_5M = Number(process.env.MIN_DEX_VOLUME_5M || 25000);
 const MIN_DEX_TXNS_5M = Number(process.env.MIN_DEX_TXNS_5M || 75);
 
-const EXECUTION_ALERT_SCORE = Number(process.env.EXECUTION_ALERT_SCORE || 88);
-const MOMENTUM_SCORE = Number(process.env.MOMENTUM_SCORE || 92);
-
+const POLYGON_API_KEY = process.env.POLYGON_API_KEY;
 const DEFAULT_COINBASE_WATCHLIST =
   "BTC-USD,ETH-USD,SOL-USD,XRP-USD,DOGE-USD,ADA-USD,LINK-USD,AVAX-USD,SUI-USD,PEPE-USD,WIF-USD,BONK-USD,FET-USD,RENDER-USD,ONDO-USD,ARB-USD,OP-USD,NEAR-USD,INJ-USD,AERO-USD";
 
@@ -97,6 +104,75 @@ function markAlerted(key, score) {
   alertMemory.set(key, { time: Date.now(), score });
 }
 
+function tier(finalScore, ignitionScore) {
+  if (finalScore >= PARABOLIC_SCORE) return "🔴 PARABOLIC RISK";
+  if (finalScore >= MOMENTUM_SCORE) return "🟢 HIGH CONVICTION";
+  if (finalScore >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE) return "🚨 IGNITION";
+  if (finalScore >= DISCOVERY_SCORE) return "🟠 DISCOVERY";
+  if (finalScore >= WATCHLIST_SCORE) return "🟡 WATCHLIST";
+  return "⚪️ HOLD";
+}
+
+function polygonUrl(path) {
+  return `https://api.polygon.io${path}${path.includes("?") ? "&" : "?"}apiKey=${encodeURIComponent(POLYGON_API_KEY)}`;
+}
+
+async function getPolygonSnapshot(category) {
+  if (!POLYGON_API_KEY) return null;
+  try {
+    const url = polygonUrl(`/v3/snapshot/locale/us/markets/stocks/${encodeURIComponent(category)}`);
+    const { data } = await axios.get(url, { timeout: 20000 });
+    return data?.tickers || [];
+  } catch (err) {
+    console.log(`STOCK: Polygon snapshot ${category} error:`, err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function getPolygonStockDiscovery() {
+  const categories = ["pre-market", "after-hours", "gainers", "mostactive"];
+  const discovered = new Map();
+  let results = [];
+
+  if (POLYGON_API_KEY) {
+    for (const category of categories) {
+      const tickers = await getPolygonSnapshot(category);
+      if (!tickers) continue;
+      for (const item of tickers.slice(0, 60)) {
+        const price = item.last?.price || item.day?.c || item.lastTrade?.p || 0;
+        const volume = item.day?.v || item.last?.volume || 0;
+        if (!price || price < 0.5) continue;
+        if (price > 500) continue;
+        if (volume < MIN_STOCK_VOLUME / 10) continue;
+        if (discovered.has(item.ticker)) continue;
+
+        discovered.set(item.ticker, true);
+        results.push({
+          market: "STOCK",
+          type: "stock",
+          symbol: item.ticker,
+          display: item.ticker,
+          price,
+          changePct: item.day?.c ? pct(item.day?.c, item.day?.o) : 0,
+          volume,
+          premarket: category === "pre-market",
+          afterHours: category === "after-hours",
+          marketCap: item.day?.marketCap || null,
+          floatShares: item.day?.float || null,
+          url: `https://finance.yahoo.com/quote/${item.ticker}`
+        });
+      }
+    }
+  }
+
+  if (results.length < 20) {
+    const yahoo = await getYahooStockDiscovery();
+    results = results.concat(yahoo.filter(x => !discovered.has(x.symbol))).slice(0, 60);
+  }
+
+  return results.slice(0, 80);
+}
+
 function trendCheck(candles) {
   if (!candles || candles.length < 20) return { aligned: false, short: false, medium: false, long: false };
   const closes = candles.map(c => c.close);
@@ -132,25 +208,38 @@ function volumeQualityCheck(asset, vols, priorVols, latestVolume) {
   const fadingVolume = recentAvg > 0 && latestVolume < recentAvg * 0.45 && relVol < 1;
   const weakVolume = relVol < 0.85;
 
-  if (hardStockFail || deadVolume || oneCandleSpike || fadingVolume || weakVolume) {
+  const reasons = [];
+  if (hardStockFail) reasons.push("stock volume/live candle volume too low");
+  if (deadVolume) reasons.push("volume is too dead/inconsistent");
+  if (oneCandleSpike) reasons.push("volume inflated by one spike");
+  if (fadingVolume) reasons.push("latest volume is fading hard");
+  if (weakVolume) reasons.push("relative volume is weak");
+  if (relVol < 1) reasons.push("RVOL under 1.0");
+
+  const bad = hardStockFail || deadVolume || oneCandleSpike || fadingVolume;
+  if (bad) {
     return {
       quality: "BAD",
       relVol,
-      reasons: [
-        hardStockFail ? "stock volume/live candle volume too low" : null,
-        deadVolume ? "volume is too dead/inconsistent" : null,
-        oneCandleSpike ? "volume looks inflated by one spike" : null,
-        fadingVolume ? "latest volume is fading hard" : null,
-        weakVolume ? "relative volume is weak" : null
-      ].filter(Boolean)
+      reasons,
+      lowRvolOnly: false
     };
   }
 
-  if (relVol >= 1.3 && latestVolume >= recentAvg * 0.9) {
-    return { quality: "GOOD", relVol, reasons: ["volume quality is clean"] };
+  if (weakVolume) {
+    return {
+      quality: ALLOW_LOW_RVOL_BREAKOUTS ? "LOW" : "BAD",
+      relVol,
+      reasons,
+      lowRvolOnly: true
+    };
   }
 
-  return { quality: "OK", relVol, reasons: ["volume is acceptable"] };
+  if (relVol >= 1.3 && latestVolume >= recentAvg * 1.1) {
+    return { quality: "GOOD", relVol, reasons: ["volume quality is clean"], lowRvolOnly: false };
+  }
+
+  return { quality: "OK", relVol, reasons: ["volume is acceptable"], lowRvolOnly: false };
 }
 
 function buildExecution(asset, analysis) {
@@ -274,14 +363,19 @@ function buildExecution(asset, analysis) {
 function shouldSendAlert(asset, analysis, execution, key) {
   if (!analysis) return { send: false, block: "Alert BLOCKED: no analysis" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
-  if (analysis.volumeQuality === "BAD") return { send: false, block: "Alert BLOCKED: bad/low volume" };
-  if (analysis.risk === "High") return { send: false, block: "Alert BLOCKED: high risk" };
-  if (!cooldownPassed(key, analysis.score)) return { send: false, block: "Alert BLOCKED: cooldown active" };
+  if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "Alert BLOCKED: high risk" };
+  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "Alert BLOCKED: cooldown active" };
 
-  if (analysis.score >= MOMENTUM_SCORE && execution.executionScore >= 70) return { send: true };
-  if (analysis.score >= EXECUTION_ALERT_SCORE && execution.executionScore >= 75) return { send: true };
+  const score = analysis.finalScore;
+  const ignitionScore = analysis.ignitionScore || 0;
 
-  return { send: false, block: "Alert BLOCKED: not profitable-quality setup" };
+  if (score >= PARABOLIC_SCORE && execution.executionScore >= 65) return { send: true };
+  if (score >= MOMENTUM_SCORE && execution.executionScore >= 68) return { send: true };
+  if (score >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE && execution.executionScore >= 62) return { send: true };
+  if (score >= DISCOVERY_SCORE && execution.executionScore >= 58) return { send: true };
+  if (score >= WATCHLIST_SCORE && execution.executionScore >= 55) return { send: true };
+
+  return { send: false, block: "Alert BLOCKED: score below alert threshold" };
 }
 
 async function getYahooStockDiscovery() {
@@ -361,9 +455,26 @@ async function getYahooCandles(symbol, interval = "5m") {
   }
 }
 
-function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = null) {
-  if (!candles5m || candles5m.length < 50) {
-    return { score: 0, setup: "No Data", blockReason: "Alert BLOCKED: no candle data" };
+function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m = null) {
+  if (!candles5m || candles5m.length < 40) {
+    return {
+      score: 0,
+      finalScore: 0,
+      setup: "No Data",
+      blockReason: "Alert BLOCKED: no candle data",
+      discoveryScore: 0,
+      structureScore: 0,
+      volumeScore: 0,
+      ignitionScore: 0,
+      riskScore: 0,
+      relVol: 0,
+      volume: asset.volume,
+      price: asset.price || 0,
+      support: null,
+      breakout: null,
+      risk: "High",
+      reasons: ["insufficient candle history"]
+    };
   }
 
   const recent = candles5m.slice(-24);
@@ -377,7 +488,6 @@ function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = nu
   const priorVols = prior.map(c => c.volume || 0);
 
   const vq = volumeQualityCheck(asset, vols, priorVols, last.volume || 0);
-
   const price = last.close;
   asset.price = price;
 
@@ -390,76 +500,87 @@ function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = nu
   const rangePct = price ? ((recentHigh - recentLow) / price) * 100 : 999;
   const distanceToBreakoutPct = breakout ? ((breakout - price) / breakout) * 100 : 999;
 
-  const pullbackHeld = price > support * 1.025;
   const higherLow = lows.at(-1) > lows.at(-8);
-  const tightening = rangePct < 6.5;
+  const tightRange = rangePct < 6.5;
+  const pullbackHeld = price > support * 1.025;
   const nearBreakout = distanceToBreakoutPct >= 0 && distanceToBreakoutPct <= 2.5;
-  const pressureBuilding = vq.relVol >= 1.15 || last.volume > avg(vols.slice(0, -1)) * 1.2;
-
   const breakoutCandle = price > breakout * 1.002;
   const volumeReturning = last.volume > avg(vols.slice(0, -1)) * 1.4;
+  const pressureBuilding = vq.relVol >= 1.15 || last.volume > avg(vols.slice(0, -1)) * 1.2;
   const noRejection = last.close > last.open && last.close > (last.high + last.low) / 2;
   const retestHeld = prev && prev.close >= breakout * 0.985 && last.close >= breakout * 0.995;
 
   const trend5m = trendCheck(candles5m);
   const trend1m = trendCheck(candles1m);
   const trend15m = trendCheck(candles15m);
-
-  const multiTimeframe =
-    trend5m.aligned &&
-    (!candles1m || trend1m.short) &&
-    (!candles15m || trend15m.medium || trend15m.long);
+  const positiveTrend = trend5m.aligned || trend1m.short || trend15m.medium || trend15m.long;
+  const multiTimeframe = trend5m.aligned && (!candles1m || trend1m.short) && (!candles15m || trend15m.medium || trend15m.long);
 
   const lowFloat = asset.market === "STOCK" && asset.floatShares && asset.floatShares < 20_000_000;
-  const extended = asset.changePct > 28;
+  const extended = asset.changePct > 28 || price > breakout * 1.04;
   const wickRisk = (last.high - last.close) > (last.high - last.low) * 0.42;
   const exhaustionRisk = extended || wickRisk || rangePct > 12;
 
-  let score = 0;
+  const supportHold = pullbackHeld || retestHeld;
+  const isConsolidation = higherLow && tightRange && supportHold;
+  const isIgnition = pressureBuilding && (nearBreakout || breakoutCandle);
+  const isBreakout = breakoutCandle && noRejection && volumeReturning;
+
+  let discoveryScore = 0;
+  let structureScore = 0;
+  let volumeScore = 0;
+  let ignitionScore = 0;
+  let riskScore = 0;
   const reasons = [...vq.reasons];
 
-  if (asset.changePct >= 4) { score += 10; reasons.push("strong move"); }
-  if (asset.changePct >= 8) { score += 10; reasons.push("major momentum move"); }
-  if (vq.relVol >= 1.15) { score += 10; reasons.push("relative volume expanding"); }
-  if (vq.relVol >= 2) { score += 10; reasons.push("strong relative volume"); }
-  if (pullbackHeld) { score += 10; reasons.push("pullback held support"); }
-  if (higherLow) { score += 10; reasons.push("higher low forming"); }
-  if (tightening) { score += 10; reasons.push("tightening under resistance"); }
-  if (nearBreakout) { score += 14; reasons.push("price near breakout trigger"); }
-  if (pressureBuilding) { score += 10; reasons.push("pressure building before breakout"); }
-  if (breakoutCandle) { score += 12; reasons.push("breakout candle"); }
-  if (volumeReturning) { score += 12; reasons.push("volume returning"); }
-  if (retestHeld) { score += 10; reasons.push("breakout/retest holding"); }
-  if (noRejection) { score += 8; reasons.push("no instant rejection"); }
-  if (multiTimeframe) { score += 12; reasons.push("multi-timeframe trend alignment"); }
-  if (lowFloat) { score += 6; reasons.push("low float squeeze potential"); }
+  if (asset.changePct >= 3) { discoveryScore += 8; reasons.push("power move detected"); }
+  if (asset.changePct >= 6) { discoveryScore += 8; reasons.push("momentum is accelerating"); }
+  if (positiveTrend) { discoveryScore += 8; reasons.push("trend bias is bullish"); }
+  if (lowFloat) { discoveryScore += 6; reasons.push("low float squeeze potential"); }
+  if (supportHold) { structureScore += 12; reasons.push("support is holding"); }
+  if (higherLow) { structureScore += 14; reasons.push("higher lows are forming"); }
+  if (tightRange) { structureScore += 12; reasons.push("tight consolidation prior to move"); }
+  if (nearBreakout) { structureScore += 10; reasons.push("price is near resistance"); }
+  if (breakout > 0 && price < breakout) { structureScore += 4; }
+  if (vq.quality === "GOOD") { volumeScore += 18; reasons.push("volume is strong and clean"); }
+  if (vq.quality === "OK") { volumeScore += 10; reasons.push("volume is acceptable"); }
+  if (vq.quality === "LOW") { volumeScore += 6; reasons.push("volume is lower but setup still structured"); }
+  if (vq.relVol >= 1.3) { volumeScore += 10; reasons.push("relative volume is rising"); }
+  if (pressureBuilding) { ignitionScore += 14; reasons.push("pressure building into move"); }
+  if (breakoutCandle) { ignitionScore += 18; reasons.push("early breakout candle seen"); }
+  if (volumeReturning) { ignitionScore += 12; reasons.push("volume is returning on rise"); }
+  if (retestHeld) { ignitionScore += 8; reasons.push("retest holding support"); }
+  if (isIgnition) { ignitionScore += 10; }
+  if (isBreakout) { ignitionScore += 16; }
 
-  if (exhaustionRisk) { score -= 20; reasons.push("warning: exhaustion/rejection risk"); }
-  if (vq.quality === "BAD") { score -= 35; reasons.push("bad volume quality blocks execution"); }
+  if (exhaustionRisk) { riskScore += 24; reasons.push("extended/rejection risk present"); }
+  if (!supportHold) { riskScore += 16; reasons.push("support not holding"); }
+  if (vq.quality === "BAD") { riskScore += 30; reasons.push("volume quality is poor"); }
+  if (asset.market === "DEX" && asset.liquidity < MIN_DEX_LIQUIDITY * 1.2) { riskScore += 12; reasons.push("DEX liquidity is thin"); }
 
-  const consolidation = pullbackHeld && higherLow && tightening;
-  const preBreakout = consolidation && nearBreakout && pressureBuilding && !breakoutCandle && !exhaustionRisk;
-  const confirmedBreakout = consolidation && breakoutCandle && noRejection && volumeReturning;
+  if (!asset.price || asset.price < 0.5) { riskScore += 12; reasons.push("price is too low for reliable pattern detection"); }
 
-  const setup = confirmedBreakout
-    ? "Breakout Execution"
-    : preBreakout
-      ? "Pre-Breakout Execution"
-      : consolidation
-        ? "Consolidation Execution Watch"
-        : `${asset.market} Discovery Watch`;
+  const rawScore = discoveryScore + structureScore + volumeScore + ignitionScore - riskScore;
+  let finalScore = scoreCap(rawScore, isBreakout ? "Breakout Execution" : isIgnition ? "Ignition Execution" : isConsolidation ? "Pre-Breakout Execution" : "Discovery", riskScore > 20 ? "High" : "Medium", vq.quality);
+  finalScore = Math.max(0, Math.min(100, finalScore));
 
-  const risk =
-    exhaustionRisk || vq.quality === "BAD"
-      ? "High"
-      : lowFloat || asset.changePct > 18
-        ? "Medium-High"
-        : "Medium";
+  let risk = "Medium";
+  if (riskScore >= 30 || exhaustionRisk || vq.quality === "BAD") risk = "High";
+  else if (riskScore >= 16 || lowFloat) risk = "Medium-High";
 
-  const finalScore = scoreCap(Math.max(0, score), setup, risk, vq.quality);
+  let setup = "Discovery Watch";
+  if (isBreakout) setup = "Breakout Execution";
+  else if (isIgnition) setup = "Ignition Setup";
+  else if (isConsolidation) setup = "Pre-Breakout Setup";
 
   return {
     score: finalScore,
+    finalScore,
+    discoveryScore,
+    structureScore,
+    volumeScore,
+    ignitionScore,
+    riskScore,
     setup,
     move: asset.changePct,
     relVol: vq.relVol,
@@ -469,8 +590,14 @@ function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = nu
     breakout,
     risk,
     volumeQuality: vq.quality,
-    reasons
+    lowRvolOnly: vq.lowRvolOnly,
+    reasons,
+    blockReason: null
   };
+}
+
+function analyzeCandleMarket(asset, candles5m, candles1m = null, candles15m = null) {
+  return analyzeMomentumIgnition(asset, candles5m, candles1m, candles15m);
 }
 
 async function scanStocks() {
@@ -479,7 +606,7 @@ async function scanStocks() {
     return [];
   }
 
-  const assets = await getYahooStockDiscovery();
+  const assets = await getPolygonStockDiscovery();
   const results = [];
 
   for (const asset of assets) {
@@ -578,15 +705,27 @@ async function scanCoinbaseCrypto() {
 }
 
 async function getDexScreenerPairs() {
-  try {
-    const { data } = await axios.get("https://api.dexscreener.com/latest/dex/search?q=solana", {
-      timeout: 15000
-    });
-    return Array.isArray(data.pairs) ? data.pairs : [];
-  } catch (err) {
-    console.log("DEX: DexScreener error:", err.message);
-    return [];
+  const queries = ["solana", "base", "ethereum"];
+  const found = new Map();
+
+  for (const query of queries) {
+    try {
+      const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`, {
+        timeout: 20000
+      });
+      const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+      for (const pair of pairs) {
+        const key = `${pair.chainId}:${pair.pairAddress || pair.url || pair.name}`;
+        if (!found.has(key)) {
+          found.set(key, pair);
+        }
+      }
+    } catch (err) {
+      console.log(`DEX: DexScreener ${query} error:`, err.message);
+    }
   }
+
+  return [...found.values()];
 }
 
 function analyzeDexPair(pair, asset) {
@@ -676,9 +815,9 @@ async function scanDexScreener() {
   const pairs = await getDexScreenerPairs();
   const results = [];
 
-  for (const pair of pairs.slice(0, 60)) {
+  for (const pair of pairs.slice(0, 120)) {
     try {
-      if (pair.chainId !== "solana") continue;
+      if (!["solana", "base", "ethereum"].includes(pair.chainId)) continue;
 
       const liquidity = pair.liquidity?.usd || 0;
       const vol5m = pair.volume?.m5 || 0;
@@ -690,7 +829,7 @@ async function scanDexScreener() {
       if (txns5m < MIN_DEX_TXNS_5M) continue;
 
       const base = pair.baseToken?.symbol || "UNKNOWN";
-      const quote = pair.quoteToken?.symbol || "SOL";
+      const quote = pair.quoteToken?.symbol || pair.quoteToken?.name || "PAIR";
       const display = `${base}/${quote}`;
 
       const asset = {
@@ -727,6 +866,33 @@ async function scanDexScreener() {
   return results;
 }
 
+async function scanMomentumIgnition() {
+  if (!ENABLE_IGNITION_SCANNER) {
+    console.log("IGNITION: disabled");
+    return [];
+  }
+
+  console.log("IGNITION: scanning stored candidates for ignition setups...");
+  const results = [];
+
+  for (const [key, entry] of state.entries()) {
+    const { asset, analysis, execution } = entry;
+    if (!analysis || !execution) continue;
+
+    const ignitionCandidate = analysis.finalScore >= IGNITION_ALERT_SCORE && analysis.ignitionScore >= IGNITION_SCORE;
+    if (!ignitionCandidate) continue;
+    if (!cooldownPassed(key, analysis.finalScore)) {
+      console.log(`${asset.market}: ${asset.display} | ALERT BLOCKED: cooldown active`);
+      continue;
+    }
+
+    await maybeAlert(asset, analysis, execution, key);
+    results.push({ asset, analysis, execution });
+  }
+
+  return results;
+}
+
 async function maybeAlert(asset, analysis, execution, key) {
   const decision = shouldSendAlert(asset, analysis, execution, key);
 
@@ -735,7 +901,7 @@ async function maybeAlert(asset, analysis, execution, key) {
     return;
   }
 
-  markAlerted(key, analysis.score);
+  markAlerted(key, analysis.finalScore);
 
   const decimals = decimalsFor(asset);
 
@@ -744,33 +910,22 @@ async function maybeAlert(asset, analysis, execution, key) {
 
 Ticker/Pair: ${asset.display}
 Market: ${asset.market}
-Tier: ${tier(analysis.score, execution.executionScore)}
-Trade State: ${execution.tradeState}
-
-Setup Score: ${analysis.score}/100
-Execution Score: ${execution.executionScore}/100
-Execution Quality: ${execution.executionQuality}
-Volume Quality: ${analysis.volumeQuality}
-Setup: ${analysis.setup}
-Risk: ${analysis.risk}
-
+Tier: ${tier(analysis.finalScore, analysis.ignitionScore)}
+Final Score: ${analysis.finalScore}/100
+Ignition Score: ${analysis.ignitionScore}/100
+Setup Type: ${analysis.setup}
 Price: ${fmtMoney(asset.price, decimals)}
 Move: ${Number(analysis.move || 0).toFixed(2)}%
-RVOL / Pressure: ${analysis.relVol?.toFixed?.(2) || "N/A"}x
 Volume: ${fmtVol(analysis.volume)}
-
-Ideal Entry Zone: ${execution.formatted.idealEntry}
-Breakout Trigger: ${execution.formatted.trigger}
-Avoid Chasing Above: ${execution.formatted.avoidAbove}
-Suggested Stop: ${execution.formatted.stop}
-
-Execution Notes:
-${execution.notes.map(n => `- ${n}`).join("\n")}
-
-Setup Reasons:
-${analysis.reasons.map(r => `- ${r}`).join("\n")}
-
-URL: ${asset.url}
+RVOL: ${analysis.relVol?.toFixed?.(2) || "N/A"}
+Support: ${analysis.support ? fmtMoney(analysis.support, decimals) : "N/A"}
+Breakout Level: ${analysis.breakout ? fmtMoney(analysis.breakout, decimals) : "N/A"}
+Stop/Fails Level: ${execution.formatted.stop}
+Risk: ${analysis.risk}
+Why It Triggered:
+- Tier threshold met
+- ${analysis.reasons.slice(0, 5).join("\n- ")}
+Chart URL: ${asset.url}
 
 Alerts only. Not financial advice.`
   );
@@ -783,6 +938,7 @@ async function scanAll() {
   if (ENABLE_STOCKS) results.push(...(await scanStocks()));
   if (ENABLE_COINBASE) results.push(...(await scanCoinbaseCrypto()));
   if (ENABLE_DEXSCREENER) results.push(...(await scanDexScreener()));
+  if (ENABLE_IGNITION_SCANNER) results.push(...(await scanMomentumIgnition()));
 
   console.log(`SCAN COMPLETE | Total tracked this run: ${results.length}`);
 }
