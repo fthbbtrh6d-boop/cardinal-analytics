@@ -21,11 +21,14 @@ const ALERT_COOLDOWN_MINUTES = Number(process.env.ALERT_COOLDOWN_MINUTES || 120)
 const WATCHLIST_SCORE = Number(process.env.WATCHLIST_SCORE || 60);
 const DISCOVERY_SCORE = Number(process.env.DISCOVERY_SCORE || 70);
 const PRE_IGNITION_SCORE = Number(process.env.PRE_IGNITION_SCORE || 70);
-const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 80);
 const MOMENTUM_SCORE = Number(process.env.MOMENTUM_SCORE || 90);
 const PARABOLIC_SCORE = Number(process.env.PARABOLIC_SCORE || 97);
 const IGNITION_SCORE = Number(process.env.IGNITION_SCORE || 78);
 const ALLOW_LOW_RVOL_BREAKOUTS = String(process.env.ALLOW_LOW_RVOL_BREAKOUTS || "true").toLowerCase() === "true";
+
+const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 45);
+const HIGH_CONVICTION_SCORE = Number(process.env.HIGH_CONVICTION_SCORE || 68);
+const EXECUTION_ALERT_SCORE = Number(process.env.EXECUTION_ALERT_SCORE || 20);
 
 const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 4);
 const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 1000000);
