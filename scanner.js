@@ -624,13 +624,14 @@ function shouldSendAlert(asset, analysis, execution, key) {
   if (!analysis) return { send: false, block: "score too low" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
   if (analysis.failedBreakoutRisk === "High") return { send: false, block: "failed breakout risk" };
-if (
-  analysis.risk === "High" &&
-  analysis.finalScore < 55 &&
-  execution.executionScore < 35
-) {
-  return { send: false, block: "high risk" };
-}  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
+  if (
+    analysis.risk === "High" &&
+    analysis.finalScore < 55 &&
+    execution.executionScore < 35
+  ) {
+    return { send: false, block: "high risk" };
+  }
+  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
   if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "low RVOL without clean structure" };
   if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") return { send: false, block: "focus market is stocks" };
 
@@ -642,6 +643,34 @@ if (
   if (asset.market === "COINBASE" && STRICT_LARGE_CAP_COINS.has(asset.symbol)) {
     if (score < MOMENTUM_SCORE || ignitionScore < 80 || analysis.breakoutCandle !== true) {
       return { send: false, block: "large cap crypto requires strong breakout momentum" };
+    }
+  }
+
+  if (asset.market === "STOCK" && score >= 72) {
+    const rvol = analysis.relVol || 0;
+    const acceleration = analysis.accelerationScore || 0;
+    const momentum = analysis.momentumQuality || "Neutral";
+    const catalyst = analysis.catalystStatus || "no catalyst found";
+    const failedRisk = analysis.failedBreakoutRisk || "Low";
+    const volumeQuality = analysis.volumeQuality || "OK";
+    const structureStrong = analysis.structureStrong || false;
+
+    if (
+      score >= 72 &&
+      executionScore >= 35 &&
+      rvol >= 1.5 &&
+      momentum !== "Weak" &&
+      acceleration > 0 &&
+      failedRisk !== "High" &&
+      volumeQuality !== "BAD" &&
+      catalyst !== "negative catalyst" &&
+      structureStrong === true
+    ) {
+      return { send: true, passedQualityFilter: true };
+    } else if (score < 72) {
+      return { send: false, block: "WATCH tier (no Telegram)" };
+    } else {
+      return { send: false, block: "quality filter" };
     }
   }
 
@@ -1428,11 +1457,20 @@ async function maybeAlert(asset, analysis, execution, key) {
     return;
   }
 
-  const alertType = analysis.finalScore >= HIGH_CONVICTION_SCORE
-    ? "High Conviction"
-    : analysis.setup?.includes("Ignition")
-      ? "Possible Entry"
-      : "Watch Only";
+  let alertTier = "WATCH";
+  if (analysis.finalScore >= 90) alertTier = "EXECUTION";
+  else if (analysis.finalScore >= 85) alertTier = "HIGH CONVICTION";
+  else if (analysis.finalScore >= 72) alertTier = "IGNITION";
+
+  const whyItPassed = asset.market === "STOCK" ? `
+\nWHY IT PASSED QUALITY FILTER:
+- RVOL: ${analysis.relVol?.toFixed(2) || "N/A"} (required: >= 1.5)
+- Acceleration Score: ${analysis.accelerationScore} (required: > 0)
+- Momentum Quality: ${analysis.momentumQuality} (required: not Weak)
+- Catalyst: ${analysis.catalystStatus} (required: not negative)
+- Float: ${analysis.floatStatus}
+- Execution Score: ${execution.executionScore}/100
+- Final Score: ${analysis.finalScore}/100` : "";
 
   console.log(`${tierLabel}: ALERT SENT: ${summary}`);
   markAlerted(key, analysis.finalScore);
@@ -1444,7 +1482,7 @@ async function maybeAlert(asset, analysis, execution, key) {
 Ticker/Pair: ${asset.display}
 Market: ${asset.market}
 Tier: ${analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore)}
-Alert Type: ${alertType}
+Alert Tier: ${alertTier}
 Final Score: ${analysis.finalScore}/100
 Ignition Score: ${analysis.ignitionScore}/100
 Momentum Quality: ${analysis.momentumQuality}
@@ -1468,7 +1506,7 @@ Stop/Fails Level: ${failLevel}
 Profit Zones: ${profitZones}
 Risk: ${analysis.risk}
 Why It Triggered:
-- ${analysis.reasons.slice(0, 5).join("\n- ")}
+- ${analysis.reasons.slice(0, 5).join("\n- ")}${whyItPassed}
 Chart URL: ${asset.url}
 
 This is a short watch alert. Not financial advice.`
