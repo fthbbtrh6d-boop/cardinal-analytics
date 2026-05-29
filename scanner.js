@@ -15,6 +15,9 @@ const ENABLE_COINBASE = String(process.env.ENABLE_COINBASE || "true").toLowerCas
 const ENABLE_DEXSCREENER = String(process.env.ENABLE_DEXSCREENER || "false").toLowerCase() === "true";
 const ENABLE_IGNITION_SCANNER = String(process.env.ENABLE_IGNITION_SCANNER || "true").toLowerCase() === "true";
 
+const FOCUS_MARKET = String(process.env.FOCUS_MARKET || "all").toLowerCase();
+const PREMARKET_MODE = String(process.env.PREMARKET_MODE || "false").toLowerCase() === "true";
+
 const SCAN_INTERVAL_SECONDS = Number(process.env.SCAN_INTERVAL_SECONDS || 60);
 const ALERT_COOLDOWN_MINUTES = Number(process.env.ALERT_COOLDOWN_MINUTES || 120);
 
@@ -26,13 +29,14 @@ const PARABOLIC_SCORE = Number(process.env.PARABOLIC_SCORE || 97);
 const IGNITION_SCORE = Number(process.env.IGNITION_SCORE || 78);
 const ALLOW_LOW_RVOL_BREAKOUTS = String(process.env.ALLOW_LOW_RVOL_BREAKOUTS || "true").toLowerCase() === "true";
 
-const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 45);
-const HIGH_CONVICTION_SCORE = Number(process.env.HIGH_CONVICTION_SCORE || 68);
-const EXECUTION_ALERT_SCORE = Number(process.env.EXECUTION_ALERT_SCORE || 20);
+const IGNITION_ALERT_SCORE = Number(process.env.IGNITION_ALERT_SCORE || 40);
+const HIGH_CONVICTION_SCORE = Number(process.env.HIGH_CONVICTION_SCORE || 62);
+const EXECUTION_ALERT_SCORE = Number(process.env.EXECUTION_ALERT_SCORE || 15);
 
-const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN || 4);
-const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME || 1000000);
-const MIN_LIVE_CANDLE_VOLUME = Number(process.env.MIN_LIVE_CANDLE_VOLUME || 50000);
+const MIN_STOCK_GAIN = Number(process.env.MIN_STOCK_GAIN != null ? process.env.MIN_STOCK_GAIN : PREMARKET_MODE ? 2 : 4);
+const MIN_STOCK_VOLUME = Number(process.env.MIN_STOCK_VOLUME != null ? process.env.MIN_STOCK_VOLUME : PREMARKET_MODE ? 50000 : 1000000);
+const MIN_LIVE_CANDLE_VOLUME = Number(process.env.MIN_LIVE_CANDLE_VOLUME != null ? process.env.MIN_LIVE_CANDLE_VOLUME : PREMARKET_MODE ? 10000 : 50000);
+const MIN_RELATIVE_VOLUME = Number(process.env.MIN_RELATIVE_VOLUME || 1.15);
 const MIN_COINBASE_VOLUME_24H = Number(process.env.MIN_COINBASE_VOLUME_24H || 2500000);
 const MIN_DEX_LIQUIDITY = Number(process.env.MIN_DEX_LIQUIDITY || 150000);
 const MAX_DEX_LIQUIDITY = Number(process.env.MAX_DEX_LIQUIDITY || 5000000);
@@ -176,7 +180,11 @@ function classifyCatalystHeadlines(news = []) {
     /launch/i,
     /regulatory/i,
     /ETF/i,
-    /catalyst/i,
+    /deal/i,
+    /grant/i,
+    /pilot/i,
+    /win/i,
+    /order/i,
   ];
   const negative = [
     /dilution/i,
@@ -313,6 +321,12 @@ function calculateFinalScore({
   failedBreakoutRisk = "Low",
   momentumQuality = "Neutral",
 }) {
+  ignitionScore = Math.max(0, Math.min(100, ignitionScore));
+  structureScore = Math.max(0, Math.min(100, structureScore));
+  continuationScore = Math.max(0, Math.min(100, continuationScore));
+  accelerationScore = Math.max(0, Math.min(100, accelerationScore));
+  breakoutPressureScore = Math.max(0, Math.min(100, breakoutPressureScore));
+
   let finalScore =
     ignitionScore * 0.45 +
     structureScore * 0.20 +
@@ -339,10 +353,10 @@ function calculateFinalScore({
 
   finalScore = Math.max(0, Math.min(100, Math.round(finalScore)));
 
-  let tierLabel = "⚪️ HOLD";
+  let tierLabel = "⚪️ WATCH";
   if (finalScore >= PARABOLIC_SCORE) tierLabel = "🔴 PARABOLIC RISK";
-  else if (finalScore >= MOMENTUM_SCORE) tierLabel = "🟢 HIGH CONVICTION";
-  else if (finalScore >= IGNITION_ALERT_SCORE) tierLabel = "🚨 IGNITION WATCH";
+  else if (finalScore >= HIGH_CONVICTION_SCORE) tierLabel = "🟢 HIGH CONVICTION";
+  else if (finalScore >= IGNITION_ALERT_SCORE && (ignitionScore >= IGNITION_SCORE || structureScore >= 35 || momentumQuality === "Strong")) tierLabel = "🚨 IGNITION WATCH";
   else if (finalScore >= PRE_IGNITION_SCORE) tierLabel = "🟠 EARLY WATCH";
   else if (finalScore >= DISCOVERY_SCORE) tierLabel = "🟡 DISCOVERY";
 
@@ -362,8 +376,8 @@ function volumeQualityCheck(asset, vols, priorVols, latestVolume) {
 
   const deadVolume = recentAvg <= 0 || vols.filter((v) => v > 0).length < Math.floor(vols.length * 0.5);
   const oneCandleSpike = recentAvg > 0 && maxVol > recentAvg * 8 && latestVolume < maxVol * 0.35;
-  const fadingVolume = recentAvg > 0 && latestVolume < recentAvg * 0.45 && normalizedRvol < 1;
-  const weakVolume = normalizedRvol < 0.9;
+  const fadingVolume = recentAvg > 0 && latestVolume < recentAvg * 0.45 && normalizedRvol < MIN_RELATIVE_VOLUME;
+  const weakVolume = normalizedRvol < MIN_RELATIVE_VOLUME;
 
   const reasons = [];
   if (hardStockFail) reasons.push("stock volume or live candle volume too low");
@@ -612,11 +626,13 @@ function shouldSendAlert(asset, analysis, execution, key) {
   if (analysis.failedBreakoutRisk === "High") return { send: false, block: "failed breakout risk" };
   if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "high risk" };
   if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
-  if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "RVOL weak without clean structure" };
+  if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "low RVOL without clean structure" };
+  if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") return { send: false, block: "focus market is stocks" };
 
   const score = analysis.finalScore;
+  const executionScore = execution.executionScore || 0;
   const ignitionScore = analysis.ignitionScore || 0;
-  const tierLabel = analysis.tierLabel || tier(score, ignitionScore);
+  const isIgnitionSetup = analysis.setup?.includes("Ignition");
 
   if (asset.market === "COINBASE" && STRICT_LARGE_CAP_COINS.has(asset.symbol)) {
     if (score < MOMENTUM_SCORE || ignitionScore < 80 || analysis.breakoutCandle !== true) {
@@ -624,28 +640,11 @@ function shouldSendAlert(asset, analysis, execution, key) {
     }
   }
 
-  if (tierLabel.includes("HIGH CONVICTION") && score >= 90 && ignitionScore >= 75 && execution.executionScore >= 68) {
-    return { send: true };
-  }
+  if (score >= HIGH_CONVICTION_SCORE) return { send: true };
+  if (score >= IGNITION_ALERT_SCORE) return { send: true };
+  if (executionScore >= EXECUTION_ALERT_SCORE && isIgnitionSetup) return { send: true };
 
-  if (tierLabel.includes("IGNITION WATCH") && score >= 82 && ignitionScore >= 65 && execution.executionScore >= 62) {
-    return { send: true };
-  }
-
-  if (tierLabel.includes("EARLY WATCH") && score >= 72 && analysis.structureStrong && execution.executionScore >= 65) {
-    return { send: true };
-  }
-
-  if (tierLabel.includes("EARLY WATCH")) {
-    return { send: false, block: "Early watch; waiting for tighter confirmation" };
-  }
-
-  if (score >= PARABOLIC_SCORE && execution.executionScore >= 65) return { send: true };
-  if (score >= MOMENTUM_SCORE && execution.executionScore >= 68) return { send: true };
-  if (score >= IGNITION_ALERT_SCORE && ignitionScore >= IGNITION_SCORE && execution.executionScore >= 62) return { send: true };
-  if (score >= PRE_IGNITION_SCORE && analysis.structureStrong && execution.executionScore >= 58) return { send: true };
-
-  return { send: false, block: "score too low" };
+  return { send: false, block: "alert thresholds not met" };
 }
 
 async function getYahooStockDiscovery() {
@@ -887,9 +886,9 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
       (reclaimHigh ? 12 : 0)
     );
   let momentumQuality = "Neutral";
-  if (accelerationScore >= 18 && breakoutPressureScore >= 20 && continuationProbability >= 60) momentumQuality = "Strong";
-  else if (accelerationScore >= 12 && breakoutPressureScore >= 14 && continuationProbability >= 45) momentumQuality = "Good";
-  else if (accelerationScore < 8 || breakoutPressureScore < 10) momentumQuality = "Weak";
+  if (accelerationScore > 0 && vq.relVol >= 2 && breakoutPressureScore >= 50) momentumQuality = "Strong";
+  else if (vq.relVol >= 1.2 && (trend5m.aligned || trend1m.short || trend15m.medium || trend15m.long)) momentumQuality = "Good";
+  else if (accelerationScore === 0 && breakoutPressureScore < 40) momentumQuality = "Weak";
 
   let discoveryScore = 0;
   let structureScore = 0;
@@ -1007,13 +1006,13 @@ function analyzeMomentumIgnition(asset, candles5m, candles1m = null, candles15m 
     finalScore,
     tierLabel: newTierLabel,
     discoveryScore,
-    structureScore,
+    structureScore: Math.max(0, Math.min(100, structureScore)),
     structureStrong,
-    volumeScore,
-    ignitionScore,
-    accelerationScore,
-    breakoutPressureScore,
-    continuationProbability,
+    volumeScore: Math.max(0, Math.min(100, volumeScore)),
+    ignitionScore: Math.max(0, Math.min(100, ignitionScore)),
+    accelerationScore: Math.max(0, Math.min(100, accelerationScore)),
+    breakoutPressureScore: Math.max(0, Math.min(100, breakoutPressureScore)),
+    continuationProbability: Math.max(0, Math.min(100, continuationProbability)),
     momentumQuality,
     riskScore,
     floatScore,
@@ -1419,6 +1418,17 @@ async function maybeAlert(asset, analysis, execution, key) {
     return;
   }
 
+  if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") {
+    console.log(`${tierLabel}: ALERT MATCHED BUT TELEGRAM SKIPPED DUE TO STOCK FOCUS: ${summary}`);
+    return;
+  }
+
+  const alertType = analysis.finalScore >= HIGH_CONVICTION_SCORE
+    ? "High Conviction"
+    : analysis.setup?.includes("Ignition")
+      ? "Possible Entry"
+      : "Watch Only";
+
   console.log(`${tierLabel}: ALERT SENT: ${summary}`);
   markAlerted(key, analysis.finalScore);
   recordAlertReplay(key, asset, analysis);
@@ -1429,6 +1439,7 @@ async function maybeAlert(asset, analysis, execution, key) {
 Ticker/Pair: ${asset.display}
 Market: ${asset.market}
 Tier: ${analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore)}
+Alert Type: ${alertType}
 Final Score: ${analysis.finalScore}/100
 Ignition Score: ${analysis.ignitionScore}/100
 Momentum Quality: ${analysis.momentumQuality}
@@ -1455,7 +1466,7 @@ Why It Triggered:
 - ${analysis.reasons.slice(0, 5).join("\n- ")}
 Chart URL: ${asset.url}
 
-Alerts only. Not financial advice.`
+This is a short watch alert. Not financial advice.`
   );
 }
 
