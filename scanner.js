@@ -246,47 +246,145 @@ async function getPolygonSnapshot(category) {
 }
 
 async function getPolygonStockDiscovery() {
-  const categories = ["pre-market", "after-hours", "gainers", "mostactive"];
   const discovered = new Map();
-  let results = [];
+  const counts = {
+    polygonGainers: 0,
+    polygonActives: 0,
+    premarketCandidates: 0,
+    watchlistCount: 0,
+  };
+
+  const nyDate = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
+  const [month, day, year, time] = nyDate.split(/[\/ ,]+/).filter(Boolean);
+  const [hour, minute] = (time || "0:0").split(":").map(Number);
+  const beforeMarketOpenOrClosed = hour < 9 || (hour === 9 && minute < 30) || hour >= 16;
+
+  const normalizePolygonItem = (item, category) => {
+    const price = item.last?.price || item.day?.c || item.lastTrade?.p || 0;
+    const volume = item.day?.v || item.last?.volume || 0;
+    if (!price || price < 0.5 || price > 500) return null;
+    return {
+      market: "STOCK",
+      type: "stock",
+      symbol: item.ticker,
+      display: item.ticker,
+      price,
+      changePct: item.day?.c && item.day?.o ? pct(item.day.c, item.day.o) : 0,
+      volume,
+      premarket: category === "pre-market",
+      afterHours: category === "after-hours",
+      marketCap: item.day?.marketCap || null,
+      floatShares: item.day?.float || null,
+      url: `https://finance.yahoo.com/quote/${item.ticker}`,
+    };
+  };
+
+  const normalizeYahooItem = (q) => {
+    const pre = q.preMarketChangePercent || 0;
+    const reg = q.regularMarketChangePercent || 0;
+    const price = q.regularMarketPrice || q.preMarketPrice || 0;
+    const volume = q.regularMarketVolume || q.preMarketVolume || q.volume || 0;
+    if (!price || price < 0.5 || price > 500) return null;
+    return {
+      market: "STOCK",
+      type: "stock",
+      symbol: q.symbol,
+      display: q.symbol,
+      price,
+      changePct: Math.abs(pre) > Math.abs(reg) ? pre : reg,
+      volume,
+      premarket: q.marketState === "PRE" || Math.abs(pre) > 0,
+      marketCap: q.marketCap || null,
+      floatShares: q.sharesOutstanding || null,
+      url: `https://finance.yahoo.com/quote/${q.symbol}`,
+    };
+  };
+
+  const addAsset = (asset) => {
+    if (!asset || !asset.symbol) return;
+    const symbol = asset.symbol.toUpperCase();
+    if (!discovered.has(symbol)) {
+      discovered.set(symbol, asset);
+    }
+  };
 
   if (POLYGON_API_KEY) {
-    for (const category of categories) {
-      const tickers = await getPolygonSnapshot(category);
-      if (!tickers) continue;
-      for (const item of tickers.slice(0, 60)) {
-        const price = item.last?.price || item.day?.c || item.lastTrade?.p || 0;
-        const volume = item.day?.v || item.last?.volume || 0;
-        if (!price || price < 0.5) continue;
-        if (price > 500) continue;
-        if (volume < MIN_STOCK_VOLUME / 10) continue;
-        if (discovered.has(item.ticker)) continue;
+    const polygonGainers = await getPolygonSnapshot("gainers");
+    const polygonActives = await getPolygonSnapshot("mostactive");
+    const polygonPremarket = await getPolygonSnapshot("pre-market");
 
-        discovered.set(item.ticker, true);
-        results.push({
-          market: "STOCK",
-          type: "stock",
-          symbol: item.ticker,
-          display: item.ticker,
-          price,
-          changePct: item.day?.c ? pct(item.day?.c, item.day?.o) : 0,
-          volume,
-          premarket: category === "pre-market",
-          afterHours: category === "after-hours",
-          marketCap: item.day?.marketCap || null,
-          floatShares: item.day?.float || null,
-          url: `https://finance.yahoo.com/quote/${item.ticker}`,
-        });
+    counts.polygonGainers = Array.isArray(polygonGainers) ? polygonGainers.length : 0;
+    counts.polygonActives = Array.isArray(polygonActives) ? polygonActives.length : 0;
+    counts.premarketCandidates = Array.isArray(polygonPremarket) ? polygonPremarket.length : 0;
+
+    for (const item of Array.isArray(polygonGainers) ? polygonGainers.slice(0, 120) : []) {
+      const asset = normalizePolygonItem(item, "gainers");
+      addAsset(asset);
+    }
+
+    for (const item of Array.isArray(polygonActives) ? polygonActives.slice(0, 120) : []) {
+      const asset = normalizePolygonItem(item, "mostactive");
+      addAsset(asset);
+    }
+
+    if (beforeMarketOpenOrClosed) {
+      for (const item of Array.isArray(polygonPremarket) ? polygonPremarket.slice(0, 120) : []) {
+        const asset = normalizePolygonItem(item, "pre-market");
+        addAsset(asset);
       }
     }
   }
 
-  if (results.length < 20) {
-    const yahoo = await getYahooStockDiscovery();
-    results = results.concat(yahoo.filter((x) => !discovered.has(x.symbol))).slice(0, 60);
+  const yahooGainers = await getYahooStockDiscovery("day_gainers", 120);
+  const yahooActives = await getYahooStockDiscovery("most_actives", 120);
+
+  for (const item of yahooGainers) {
+    const asset = normalizeYahooItem(item);
+    if (asset) addAsset(asset);
   }
 
-  return results.slice(0, 80);
+  for (const item of yahooActives) {
+    const asset = normalizeYahooItem(item);
+    if (asset) addAsset(asset);
+  }
+
+  const watchlistSymbols = [...state.keys()]
+    .filter((key) => key.startsWith("STOCK:"))
+    .map((key) => key.replace(/^STOCK:/, ""));
+
+  counts.watchlistCount = watchlistSymbols.length;
+  for (const symbol of watchlistSymbols) {
+    const entry = state.get(`STOCK:${symbol}`);
+    if (!entry?.asset) continue;
+    const asset = entry.asset;
+    if (asset.price && asset.price >= 0.5 && asset.price <= 500) {
+      addAsset({
+        market: "STOCK",
+        type: "stock",
+        symbol: asset.symbol,
+        display: asset.display,
+        price: asset.price,
+        changePct: asset.changePct || 0,
+        volume: asset.volume || 0,
+        premarket: asset.premarket || false,
+        afterHours: asset.afterHours || false,
+        marketCap: asset.marketCap || null,
+        floatShares: asset.floatShares || asset.sharesOutstanding || null,
+        url: asset.url,
+      });
+    }
+  }
+
+  const universe = [...discovered.values()];
+
+  console.log("STOCK DISCOVERY:");
+  console.log(`- polygon gainers count: ${counts.polygonGainers}`);
+  console.log(`- active volume count: ${counts.polygonActives}`);
+  console.log(`- premarket candidates count: ${counts.premarketCandidates}`);
+  console.log(`- watchlist count: ${counts.watchlistCount}`);
+  console.log(`- final unique stock universe count: ${universe.length}`);
+
+  return universe;
 }
 
 function trendCheck(candles) {
@@ -679,9 +777,9 @@ function shouldSendAlert(asset, analysis, execution, key) {
   return { send: false, block: "alert thresholds not met", verdict: "WATCHLIST" };
 }
 
-async function getYahooStockDiscovery() {
+async function getYahooStockDiscovery(scrId = "day_gainers", count = 75) {
   try {
-    const url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=75";
+    const url = `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=${encodeURIComponent(scrId)}&count=${count}`;
     const { data } = await axios.get(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       timeout: 15000,
@@ -694,7 +792,7 @@ async function getYahooStockDiscovery() {
         const pre = q.preMarketChangePercent || 0;
         const reg = q.regularMarketChangePercent || 0;
         const move = Math.abs(pre) > Math.abs(reg) ? pre : reg;
-        const volume = q.preMarketVolume || q.regularMarketVolume || 0;
+        const volume = q.preMarketVolume || q.regularMarketVolume || q.regularMarketVolume || q.volume || 0;
 
         return {
           market: "STOCK",
@@ -704,15 +802,14 @@ async function getYahooStockDiscovery() {
           price: q.regularMarketPrice || q.preMarketPrice || 0,
           changePct: move,
           volume,
-          premarket: Math.abs(pre) > 0,
+          premarket: q.marketState === "PRE" || Math.abs(pre) > 0,
           marketCap: q.marketCap || null,
           floatShares: q.sharesOutstanding || null,
           url: `https://finance.yahoo.com/quote/${q.symbol}`,
         };
       })
-      .filter((x) => x.price > 1 && x.changePct >= MIN_STOCK_GAIN && x.volume >= MIN_STOCK_VOLUME)
-      .sort((a, b) => b.changePct - a.changePct)
-      .slice(0, 30);
+      .filter((x) => x.price > 0)
+      .slice(0, count);
   } catch (err) {
     console.log("STOCK: Yahoo discovery error:", err.message);
     return [];
