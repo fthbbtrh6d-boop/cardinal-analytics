@@ -632,53 +632,51 @@ function shouldSendAlert(asset, analysis, execution, key) {
     return { send: false, block: "high risk" };
   }
   if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
-  if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "low RVOL without clean structure" };
-  if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") return { send: false, block: "focus market is stocks" };
+  if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "low RVOL without clean structure", verdict: "REJECT" };
+  if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") return { send: false, block: "focus market is stocks", verdict: "WATCHLIST" };
 
   const score = analysis.finalScore;
   const executionScore = execution.executionScore || 0;
   const ignitionScore = analysis.ignitionScore || 0;
   const isIgnitionSetup = analysis.setup?.includes("Ignition");
 
-  if (asset.market === "COINBASE" && STRICT_LARGE_CAP_COINS.has(asset.symbol)) {
-    if (score < MOMENTUM_SCORE || ignitionScore < 80 || analysis.breakoutCandle !== true) {
-      return { send: false, block: "large cap crypto requires strong breakout momentum" };
-    }
-  }
-
-  if (asset.market === "STOCK" && score >= 72) {
-    const rvol = analysis.relVol || 0;
+  if (asset.market === "STOCK") {
+    const relVol = analysis.relVol || 0;
     const acceleration = analysis.accelerationScore || 0;
-    const momentum = analysis.momentumQuality || "Neutral";
-    const catalyst = analysis.catalystStatus || "no catalyst found";
+    const momentumQuality = String(analysis.momentumQuality || "").toLowerCase();
     const failedRisk = analysis.failedBreakoutRisk || "Low";
-    const volumeQuality = analysis.volumeQuality || "OK";
-    const structureStrong = analysis.structureStrong || false;
+    const mtfConfirmed = String(analysis.mtfStatus || "").toLowerCase() === "confirmed";
+
+    if (score < 60 || failedRisk === "High" || momentumQuality === "weak" || acceleration <= 0) {
+      return { send: false, block: "reject", verdict: "REJECT" };
+    }
 
     if (
-      score >= 72 &&
-      executionScore >= 35 &&
-      rvol >= 1.5 &&
-      momentum !== "Weak" &&
-      acceleration > 0 &&
+      score >= 75 &&
+      executionScore >= 50 &&
+      relVol >= 2.0 &&
+      momentumQuality === "good" &&
       failedRisk !== "High" &&
-      volumeQuality !== "BAD" &&
-      catalyst !== "negative catalyst" &&
-      structureStrong === true
+      acceleration > 10 &&
+      mtfConfirmed
     ) {
-      return { send: true, passedQualityFilter: true };
-    } else if (score < 72) {
-      return { send: false, block: "WATCH tier (no Telegram)" };
-    } else {
-      return { send: false, block: "quality filter" };
+      return { send: true, verdict: "A+ SETUP" };
+    }
+
+    return { send: false, block: "watchlist", verdict: "WATCHLIST" };
+  }
+
+  if (asset.market === "COINBASE" && STRICT_LARGE_CAP_COINS.has(asset.symbol)) {
+    if (score < MOMENTUM_SCORE || ignitionScore < 80 || analysis.breakoutCandle !== true) {
+      return { send: false, block: "large cap crypto requires strong breakout momentum", verdict: "REJECT" };
     }
   }
 
-  if (score >= HIGH_CONVICTION_SCORE) return { send: true };
-  if (score >= IGNITION_ALERT_SCORE) return { send: true };
-  if (executionScore >= EXECUTION_ALERT_SCORE && isIgnitionSetup) return { send: true };
+  if (score >= HIGH_CONVICTION_SCORE) return { send: true, verdict: "A+ SETUP" };
+  if (score >= IGNITION_ALERT_SCORE) return { send: true, verdict: "A+ SETUP" };
+  if (executionScore >= EXECUTION_ALERT_SCORE && isIgnitionSetup) return { send: true, verdict: "A+ SETUP" };
 
-  return { send: false, block: "alert thresholds not met" };
+  return { send: false, block: "alert thresholds not met", verdict: "WATCHLIST" };
 }
 
 async function getYahooStockDiscovery() {
@@ -1448,7 +1446,7 @@ async function maybeAlert(asset, analysis, execution, key) {
 
   const tierLabel = analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore);
   if (!decision.send) {
-    console.log(`${tierLabel}: ALERT BLOCKED: ${summary} | ${decision.block}`);
+    console.log(`${tierLabel}: ALERT BLOCKED: ${summary} | ${decision.block} | VERDICT: ${decision.verdict || "WATCHLIST"}`);
     return;
   }
 
@@ -1457,22 +1455,8 @@ async function maybeAlert(asset, analysis, execution, key) {
     return;
   }
 
-  let alertTier = "WATCH";
-  if (analysis.finalScore >= 90) alertTier = "EXECUTION";
-  else if (analysis.finalScore >= 85) alertTier = "HIGH CONVICTION";
-  else if (analysis.finalScore >= 72) alertTier = "IGNITION";
-
-  const whyItPassed = asset.market === "STOCK" ? `
-\nWHY IT PASSED QUALITY FILTER:
-- RVOL: ${analysis.relVol?.toFixed(2) || "N/A"} (required: >= 1.5)
-- Acceleration Score: ${analysis.accelerationScore} (required: > 0)
-- Momentum Quality: ${analysis.momentumQuality} (required: not Weak)
-- Catalyst: ${analysis.catalystStatus} (required: not negative)
-- Float: ${analysis.floatStatus}
-- Execution Score: ${execution.executionScore}/100
-- Final Score: ${analysis.finalScore}/100` : "";
-
-  console.log(`${tierLabel}: ALERT SENT: ${summary}`);
+  const verdict = decision.verdict || "A+ SETUP";
+  console.log(`${tierLabel}: ALERT SENT: ${summary} | VERDICT: ${verdict}`);
   markAlerted(key, analysis.finalScore);
   recordAlertReplay(key, asset, analysis);
 
@@ -1480,36 +1464,23 @@ async function maybeAlert(asset, analysis, execution, key) {
 `🚨 CARDINAL EXECUTION ENGINE
 
 Ticker/Pair: ${asset.display}
-Market: ${asset.market}
-Tier: ${analysis.tierLabel || tier(analysis.finalScore, analysis.ignitionScore)}
-Alert Tier: ${alertTier}
-Final Score: ${analysis.finalScore}/100
-Ignition Score: ${analysis.ignitionScore}/100
-Momentum Quality: ${analysis.momentumQuality}
-Continuation Probability: ${analysis.continuationProbability}%
-Setup Type: ${analysis.setup}
 Price: ${fmtMoney(asset.price, decimals)}
-Move: ${Number(analysis.move || 0).toFixed(2)}%
-Volume: ${fmtVol(analysis.volume)}
-RVOL: ${analysis.relVol?.toFixed?.(2) || "N/A"}
-Float: ${analysis.floatStatus}
-Catalyst: ${analysis.catalystStatus}
-Breakout Pressure: ${analysis.breakoutPressureScore}
+Final Score: ${analysis.finalScore}/100
+Execution Score: ${execution.executionScore}/100
+RVOL: ${analysis.relVol?.toFixed(2) || "N/A"}
 Acceleration: ${analysis.accelerationScore}
-MTF Confirmation: ${analysis.mtfStatus}
-Failed Breakout Risk: ${analysis.failedBreakoutRisk}
-Replay Status: ${analysis.replayStatus}
-Support: ${analysis.support ? fmtMoney(analysis.support, decimals) : "N/A"}
+Momentum Quality: ${analysis.momentumQuality}
+Catalyst: ${analysis.catalystStatus}
+Continuation Probability: ${analysis.continuationProbability}%
 Breakout Level: ${analysis.breakout ? fmtMoney(analysis.breakout, decimals) : "N/A"}
 Best Entry: ${bestEntry}
-Stop/Fails Level: ${failLevel}
+Stop Level: ${failLevel}
 Profit Zones: ${profitZones}
-Risk: ${analysis.risk}
-Why It Triggered:
-- ${analysis.reasons.slice(0, 5).join("\n- ")}${whyItPassed}
+VERDICT: ${verdict}
+
 Chart URL: ${asset.url}
 
-This is a short watch alert. Not financial advice.`
+Alerts only. Not financial advice.`
   );
 }
 
