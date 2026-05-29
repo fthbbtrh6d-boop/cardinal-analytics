@@ -624,8 +624,13 @@ function shouldSendAlert(asset, analysis, execution, key) {
   if (!analysis) return { send: false, block: "score too low" };
   if (analysis.blockReason) return { send: false, block: analysis.blockReason };
   if (analysis.failedBreakoutRisk === "High") return { send: false, block: "failed breakout risk" };
-  if (analysis.risk === "High" && analysis.finalScore < PARABOLIC_SCORE) return { send: false, block: "high risk" };
-  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
+if (
+  analysis.risk === "High" &&
+  analysis.finalScore < 55 &&
+  execution.executionScore < 35
+) {
+  return { send: false, block: "high risk" };
+}  if (!cooldownPassed(key, analysis.finalScore)) return { send: false, block: "cooldown active" };
   if (analysis.volumeQuality === "LOW" && !analysis.structureStrong) return { send: false, block: "low RVOL without clean structure" };
   if (FOCUS_MARKET === "stocks" && asset.market !== "STOCK") return { send: false, block: "focus market is stocks" };
 
